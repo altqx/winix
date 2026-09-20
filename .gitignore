@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+.winix/
+artifacts/
+TestResults/
+*.user
+*.iso
+*.qcow2
+*.pfx
+**/__pycache__/

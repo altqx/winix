@@ -1,0 +1,13 @@
+version: 1
+image: windows-dev
+workspace: acceptance
+pipeline: [build, test]
+tasks:
+  build:
+    script: ./build.ps1
+    timeoutSeconds: 2400
+    artifacts: [out]
+  test:
+    script: ./test.ps1
+    timeoutSeconds: 600
+    artifacts: [results]

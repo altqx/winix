@@ -1,0 +1,19 @@
+version: 1
+image: windows-dev
+workspace: native-ci
+pipeline: [build, test]
+tasks:
+  build:
+    script: |
+      if (Test-Path previous-run.txt) { throw 'CI workspace contains a previous run' }
+      'This file must not appear in the next CI VM.' | Set-Content previous-run.txt
+      cmake -S native -B out/native -A x64
+      if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      cmake --build out/native --config Debug
+    timeoutSeconds: 600
+    artifacts: [out/native/Debug/WinixNative.exe]
+  test:
+    executable: ctest
+    arguments: [--test-dir, out/native, -C, Debug, --output-on-failure, --output-junit, results.xml]
+    timeoutSeconds: 120
+    artifacts: [out/native/results.xml]

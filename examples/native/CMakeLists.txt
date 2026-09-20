@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.24)
+project(WinixNative LANGUAGES CXX)
+enable_testing()
+add_executable(WinixNative WIN32 main.cpp)
+target_compile_definitions(WinixNative PRIVATE UNICODE _UNICODE)
+add_executable(NativeTest test.cpp)
+add_test(NAME arithmetic COMMAND NativeTest)

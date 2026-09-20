@@ -1,0 +1,23 @@
+{
+  "version": "1.0",
+  "components": [
+    "Microsoft.VisualStudio.Workload.NativeDesktop",
+    "Microsoft.VisualStudio.Workload.ManagedDesktop",
+    "Microsoft.VisualStudio.Workload.Universal",
+    "Microsoft.VisualStudio.Component.VC.ATLMFC",
+    "Microsoft.VisualStudio.Component.VC.CLI.Support",
+    "Microsoft.VisualStudio.Component.VC.CMake.Project",
+    "Microsoft.VisualStudio.ComponentGroup.VC.Tools.143.x86.x64",
+    "Microsoft.VisualStudio.ComponentGroup.UWP.Support",
+    "Microsoft.VisualStudio.ComponentGroup.UWP.VC",
+    "Microsoft.VisualStudio.ComponentGroup.UWP.VC.v143",
+    "Microsoft.VisualStudio.Component.WindowsAppSdkSupport.Cpp",
+    "Microsoft.VisualStudio.ComponentGroup.MSIX.Packaging",
+    "Microsoft.VisualStudio.Component.Windows11SDK.26100",
+    "Microsoft.Net.Component.4.8.SDK",
+    "Microsoft.Net.Component.4.8.TargetingPack",
+    "Microsoft.Net.Component.4.8.1.SDK",
+    "Microsoft.Net.Component.4.8.1.TargetingPack",
+    "Microsoft.NetCore.Component.SDK"
+  ]
+}

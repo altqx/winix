@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><RuntimeIdentifiers>linux-x64;win-x64</RuntimeIdentifiers></PropertyGroup>
+  <ItemGroup><PackageReference Include="YamlDotNet" Version="18.1.0" /></ItemGroup>
+  <ItemGroup><InternalsVisibleTo Include="Winix.Tests" /></ItemGroup>
+</Project>
