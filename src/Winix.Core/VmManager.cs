@@ -173,13 +173,14 @@ public sealed class VmManager(StateStore store, ICommandRunner runner)
     }
     public async Task<JsonElement> ProvisionStatus(string vm) => Wire.Decode<JsonElement>(
         await GuestExec(vm, @"C:\Windows\System32\cmd.exe", ["/c", @"type C:\Winix\provision.json"]));
-    public async Task<string> GuestExec(string vm, string executable, string[] arguments)
+    public async Task<string> GuestExec(string vm, string executable, string[] arguments, TimeSpan? timeout = null)
     {
         store.Read<VmRecord>("vms", vm);
         var request = Wire.Encode(new { execute = "guest-exec", arguments = new Dictionary<string, object> { ["path"] = executable, ["arg"] = arguments, ["capture-output"] = true } });
         var started = Wire.Decode<JsonElement>(await Virsh("qemu-agent-command", "winix-" + vm, request));
         var pid = started.GetProperty("return").GetProperty("pid").GetInt32();
-        for (var i = 0; i < 30; i++)
+        var polls = (int)((timeout ?? TimeSpan.FromSeconds(15)).TotalMilliseconds / 500);
+        for (var i = 0; i < polls; i++)
         {
             var result = Wire.Decode<JsonElement>(await Virsh("qemu-agent-command", "winix-" + vm, Wire.Encode(new { execute = "guest-exec-status", arguments = new { pid } }))).GetProperty("return");
             if (result.GetProperty("exited").GetBoolean())

@@ -278,6 +278,82 @@ public sealed class WinixService(StateStore store, ICommandRunner runner)
         return Guest(vm).Call("elevated.run", new { kind, arguments }, ct);
     }
 
+    /// <summary>
+    /// Replaces the desktop worker on a running VM with a freshly published guest. The archive goes in over SSH; the swap runs
+    /// as SYSTEM through the QEMU guest agent because C:\Winix\agent is read-only to the test user. Also creates the data
+    /// directories and the WinixElevated task that newer provisioning would have made, so an existing image gains them.
+    /// </summary>
+    public async Task<object> UpdateGuest(string vm, string guestDirectory, string? owner = null, CancellationToken ct = default)
+    {
+        RequireAccess(vm, owner);
+        if (!File.Exists(Path.Combine(guestDirectory, "winix-guest.exe"))) throw new WinixException("guest_missing", $"No winix-guest.exe in {guestDirectory}; run scripts/publish.sh or dotnet publish src/Winix.Guest.");
+        if (await Vms.Status(vm) != "running") throw new WinixException("vm_not_running", "Start the VM before updating its worker.");
+        string? previous = null;
+        try
+        {
+            var health = await Guest(vm).Call("health", new { }, ct);
+            if (health.TryGetProperty("activeJob", out var active) && active.ValueKind != JsonValueKind.Null) throw new WinixException("busy", $"Job {active.GetString()} is running; wait or cancel it first.");
+            previous = health.TryGetProperty("version", out var v) ? v.GetString() : null;
+        }
+        catch (WinixException e) when (e.Code is "transport_error" or "desktop_unavailable") { /* a dead worker is exactly what an update fixes */ }
+        var name = "agent-" + Guid.NewGuid().ToString("N") + ".zip";
+        var archive = Path.Combine(store.Root, name);
+        try
+        {
+            ZipFile.CreateFromDirectory(guestDirectory, archive, CompressionLevel.Fastest, false);
+            await Guest(vm).Upload(archive, name, ct);
+        }
+        finally { if (File.Exists(archive)) File.Delete(archive); }
+        var script = UpdateScript.Replace("__ARCHIVE__", name);
+        var output = await Vms.GuestExec(vm, @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script))], TimeSpan.FromMinutes(5));
+        JsonElement? after = null; string? error = null;
+        for (var i = 0; i < 60 && after is null; i++)
+        {
+            await Task.Delay(2000, ct);
+            try { after = await Guest(vm).Call("health", new { }, ct); } catch (WinixException e) { error = e.Message; }
+        }
+        if (after is null) throw new WinixException("worker_unavailable", $"The worker did not come back after the update: {error}. Guest output: {output.Trim()}");
+        return new { vm, previousVersion = previous, version = after.Value.GetProperty("version").GetString(), elevationAvailable = after.Value.TryGetProperty("elevationAvailable", out var el) && el.GetBoolean(),
+            features = after.Value.TryGetProperty("features", out var f) ? f : default, guestOutput = output.Trim() };
+    }
+    private const string UpdateScript = """
+        $ErrorActionPreference = 'Stop'
+        $root = 'C:\Winix'; $zip = "$root\inbox\__ARCHIVE__"
+        if (!(Test-Path -LiteralPath $zip)) { throw "Archive not found: $zip" }
+        Stop-ScheduledTask -TaskName WinixDesktop -ErrorAction SilentlyContinue
+        Get-Process winix-guest -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        $new = "$root\agent.new"; $old = "$root\agent.old"
+        foreach ($d in @($new, $old)) { if (Test-Path $d) { Remove-Item $d -Recurse -Force } }
+        Expand-Archive -LiteralPath $zip -DestinationPath $new -Force
+        if (!(Test-Path "$new\winix-guest.exe")) { throw 'The archive contains no winix-guest.exe.' }
+        $swapped = $false
+        for ($i = 0; $i -lt 10 -and !$swapped; $i++) {
+          try { Rename-Item "$root\agent" $old -ErrorAction Stop; $swapped = $true } catch { Start-Sleep -Seconds 1 }
+        }
+        if (!$swapped) { throw 'C:\Winix\agent is still in use.' }
+        Rename-Item $new "$root\agent"
+        Remove-Item $old -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        $user = Get-LocalUser -Name winix
+        foreach ($dir in @('work','jobs','inbox','exports','elevated','dumps','profiles','cache','launch','tools')) {
+          New-Item -ItemType Directory "$root\$dir" -Force | Out-Null
+          & icacls "$root\$dir" /grant "*$($user.SID):(OI)(CI)M" | Out-Null
+        }
+        $scheduler = New-Object -ComObject Schedule.Service; $scheduler.Connect()
+        $definition = $scheduler.NewTask(0)
+        $definition.RegistrationInfo.Description = 'Winix elevated runner (tasks flagged elevated: true, winix guest driver add)'
+        $definition.Principal.UserId = 'SYSTEM'; $definition.Principal.LogonType = 5; $definition.Principal.RunLevel = 1
+        $definition.Settings.ExecutionTimeLimit = 'PT4H'; $definition.Settings.MultipleInstances = 2; $definition.Settings.AllowDemandStart = $true
+        $definition.Settings.DisallowStartIfOnBatteries = $false; $definition.Settings.StopIfGoingOnBatteries = $false; $definition.Settings.StartWhenAvailable = $true
+        $action = $definition.Actions.Create(0); $action.Path = "$root\agent\winix-guest.exe"; $action.Arguments = 'elevated'; $action.WorkingDirectory = $root
+        $sddl = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$($user.SID.Value))"
+        $scheduler.GetFolder('\').RegisterTaskDefinition('WinixElevated', $definition, 6, 'SYSTEM', $null, 5, $sddl) | Out-Null
+        Start-ScheduledTask -TaskName WinixDesktop
+        Write-Output "agent replaced; WinixElevated registered; WinixDesktop restarted"
+        """;
+
     public async Task<object> Ci(string configFile, string root, string destination, CancellationToken ct = default)
     {
         var config = WinixConfig.Load(configFile);

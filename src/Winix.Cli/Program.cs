@@ -153,7 +153,9 @@ internal static class Entry
                 }
                 case "guest":
                     if (args.Word(1) == "driver" && args.Word(2) == "add") result = await service.Elevated(vm, "driver-add", new { inf = args.Word(3) }, owner, ct);
-                    else throw new WinixException("usage", "guest driver add GUEST_INF_PATH");
+                    else if (args.Word(1) == "update")
+                        result = await service.UpdateGuest(vm, Path.GetFullPath(args.Option("guest") ?? new[] { "artifacts/release/guest", "artifacts/guest" }.FirstOrDefault(d => File.Exists(Path.Combine(d, "winix-guest.exe"))) ?? "artifacts/guest"), owner, ct);
+                    else throw new WinixException("usage", "guest driver add GUEST_INF_PATH | guest update [--guest DIR]");
                     break;
                 case "ci":
                     result = await service.Ci(configFile, root, args.Option("output") ?? "artifacts/runs", ct);
@@ -289,6 +291,7 @@ Winix — Windows build and desktop testing from Linux
                                  doubleclick, type, text, keys, wait, assert, screenshot, monitors,
                                  kill, dump, batch, pointer, drag, calibrate, deploy, uninstall
   guest driver add GUEST_INF      Install a driver through the provisioned elevated task
+  guest update [--guest DIR]      Replace the worker on a running VM with a published guest (via QEMU guest agent)
   ci                              Clean overlay → sync → pipeline → export → cleanup
   mcp                             Strict MCP 2026-07-28 stdio server
 

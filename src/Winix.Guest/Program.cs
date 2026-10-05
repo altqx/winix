@@ -49,6 +49,10 @@ internal static class Program
             if (args is not ["worker"]) { Console.Error.WriteLine("winix-guest worker | rpc | ui | elevated"); return 2; }
             using var instance = new Mutex(true, "Local\\WinixDesktopWorker", out var created);
             if (!created) throw new WinixException("worker_running", "A desktop worker is already running.");
+            // Started by Task Scheduler in the interactive session, a console app gets a terminal window that can take
+            // the foreground away from the app under test. Hide it; the worker logs nothing to the console anyway.
+            var console = GetConsoleWindow();
+            if (console != IntPtr.Zero) ShowWindow(console, 0);
             foreach (var dir in new[] { "work", "jobs", "inbox", "exports" }) Directory.CreateDirectory(Path.Combine(Root, dir));
             using var dispatcher = new Dispatcher();
             while (true)
@@ -83,4 +87,6 @@ internal static class Program
         }
     }
     [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(IntPtr context);
+    [DllImport("kernel32.dll")] private static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int command);
 }
