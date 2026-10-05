@@ -7,7 +7,8 @@ namespace Winix;
 public sealed class ImageBuilder(StateStore store, ICommandRunner runner)
 {
     private readonly VmManager vms = new(store, runner);
-    public async Task<VmRecord> Build(string name, string? iso, string guestDirectory, string edition = "Community", Resources? resources = null)
+    public record NvdaRecipe(string Url, string Sha256);
+    public async Task<VmRecord> Build(string name, string? iso, string guestDirectory, string edition = "Community", Resources? resources = null, NvdaRecipe? nvda = null)
     {
         Paths.Id(name);
         if (edition is not ("Community" or "Professional" or "Enterprise")) throw new WinixException("invalid_edition", "Use Community, Professional or Enterprise.");
@@ -33,12 +34,13 @@ public sealed class ImageBuilder(StateStore store, ICommandRunner runner)
         var seed = Path.Combine(directory, "seed"); Directory.CreateDirectory(seed);
         VmManager.CopyTree(guestDirectory, Path.Combine(seed, "agent"));
         File.Copy(Path.Combine(directory, "id_ed25519.pub"), Path.Combine(seed, "authorized_keys"));
-        var bootstrap = Path.Combine(AppContext.BaseDirectory, "provisioning", "bootstrap.ps1");
-        if (!File.Exists(bootstrap)) throw new WinixException("provisioning_missing", bootstrap);
-        File.Copy(bootstrap, Path.Combine(seed, "bootstrap.ps1"));
-        File.Copy(Path.Combine(AppContext.BaseDirectory, "provisioning", "desktop.vsconfig"), Path.Combine(seed, "desktop.vsconfig"));
+        var provisioning = Path.Combine(AppContext.BaseDirectory, "provisioning");
+        if (!File.Exists(Path.Combine(provisioning, "bootstrap.ps1"))) throw new WinixException("provisioning_missing", provisioning);
+        // bootstrap.ps1 plus the debloat, measurement and optional NVDA recipes it calls, and the Visual Studio component list.
+        foreach (var file in Directory.GetFiles(provisioning)) File.Copy(file, Path.Combine(seed, Path.GetFileName(file)));
+        if (nvda is not null && (nvda.Sha256.Length != 64 || !nvda.Sha256.All(Uri.IsHexDigit))) throw new WinixException("usage", "--nvda-sha256 must be a 64-digit hex SHA-256.");
         var password = Convert.ToHexString(RandomNumberGenerator.GetBytes(24)) + "aA1!";
-        File.WriteAllText(Path.Combine(seed, "settings.json"), Wire.Encode(new { edition, password }));
+        File.WriteAllText(Path.Combine(seed, "settings.json"), Wire.Encode(new { edition, password, nvda }));
         File.WriteAllText(Path.Combine(seed, "Autounattend.xml"), AnswerFile(password));
         if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(seed, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var seedIso = Path.Combine(directory, "seed.iso");
@@ -70,6 +72,12 @@ public sealed class ImageBuilder(StateStore store, ICommandRunner runner)
             if (!toolchain.TryGetProperty("ready", out var ready) || !ready.GetBoolean()) throw new WinixException("provisioning_incomplete", "Windows toolchain provisioning has not finished.");
             if (health.TryGetProperty("activeJob", out var active) && active.ValueKind != JsonValueKind.Null) throw new WinixException("busy", "A job is still running.");
             File.WriteAllText(Path.Combine(vm.Directory, "toolchain.json"), toolchain.GetRawText());
+            // The debloat manifest and before/after measurements travel with the baseline, so the gain is on record.
+            foreach (var evidence in new[] { "debloat.json", "measure-before.json", "measure-after.json" })
+            {
+                try { File.WriteAllText(Path.Combine(vm.Directory, evidence), await vms.GuestExec(vmName, @"C:\Windows\System32\cmd.exe", ["/c", $"type C:\\Winix\\{evidence}"])); }
+                catch (WinixException) { /* older images have no debloat record */ }
+            }
             await vms.Down(vmName);
         }
         using var guard = store.Lock();
@@ -80,7 +88,7 @@ public sealed class ImageBuilder(StateStore store, ICommandRunner runner)
         if (Directory.Exists(destination)) throw new WinixException("image_exists", "Choose a new image name; baselines are immutable.");
         Directory.CreateDirectory(destination);
         await CaptureDisk(runner, Path.Combine(vm.Directory, "disk.qcow2"), Path.Combine(destination, "disk.qcow2"));
-        foreach (var file in new[] { "nvram.fd", "id_ed25519", "hostkey.pub", "toolchain.json", "inputs.json" })
+        foreach (var file in new[] { "nvram.fd", "id_ed25519", "hostkey.pub", "toolchain.json", "inputs.json", "debloat.json", "measure-before.json", "measure-after.json" })
             if (File.Exists(Path.Combine(vm.Directory, file))) File.Copy(Path.Combine(vm.Directory, file), Path.Combine(destination, file));
         VmManager.CopyTree(Path.Combine(vm.Directory, "tpm"), Path.Combine(destination, "tpm"));
         VmManager.SetPrivateKey(destination);

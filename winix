@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# Repository launcher. Prefers the published Release binary (ReadyToRun, no JIT warm-up per call), then a
+# Release build, then Debug. Set WINIX_BUILD=Debug to force the development build while iterating.
 set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-exec dotnet "$repo_dir/src/Winix.Cli/bin/Debug/net10.0/winix.dll" "$@"
+if [ "${WINIX_BUILD:-}" != "Debug" ]; then
+  if [ -x "$repo_dir/artifacts/release/winix" ]; then exec "$repo_dir/artifacts/release/winix" "$@"; fi
+  if [ -f "$repo_dir/src/Winix.Cli/bin/Release/net10.0/winix.dll" ]; then exec dotnet "$repo_dir/src/Winix.Cli/bin/Release/net10.0/winix.dll" "$@"; fi
+fi
+if [ -f "$repo_dir/src/Winix.Cli/bin/Debug/net10.0/winix.dll" ]; then exec dotnet "$repo_dir/src/Winix.Cli/bin/Debug/net10.0/winix.dll" "$@"; fi
+echo "winix: no build found. Run scripts/publish.sh (fast daily binary) or dotnet build." >&2
+exit 3

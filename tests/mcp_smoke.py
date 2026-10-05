@@ -36,17 +36,28 @@ with tempfile.TemporaryDirectory(prefix="winix-mcp-") as state:
         tools = request("tools/list", {"_meta": meta()})["result"]["tools"]
         names = [tool["name"] for tool in tools]
         assert len(names) == len(set(names))
-        assert {"job_start", "desktop_action", "desktop_screenshot", "workspace_sync"} <= set(names)
+        assert {"job_start", "job_wait", "job_dump", "desktop_action", "desktop_screenshot", "workspace_sync", "workspace_push", "workspace_pull",
+                "vm_lease", "vm_device", "vm_devices", "guest_driver_add"} <= set(names)
+        start = next(tool for tool in tools if tool["name"] == "job_start")["inputSchema"]["properties"]
+        assert {"env", "args", "label", "queueSeconds", "owner"} <= set(start)
         assert request("tools/list", {"_meta": meta()})["result"]["tools"] == tools
         wrong = request("tools/list", {"_meta": meta("2025-11-25")})
         assert "error" in wrong
         missing = request("tools/list", {})
         assert "error" in missing
         response = request("tools/call", {"_meta": meta(), "name": "vm_list", "arguments": {}})
-        assert response["result"]["structuredContent"] == []
+        assert json.loads(response["result"]["content"][0]["text"]) == []
         unknown = request("tools/call", {"_meta": meta(), "name": "does_not_exist", "arguments": {}})
         assert "error" in unknown or unknown["result"].get("isError")
-        print(f"MCP smoke passed: strict revision, discovery, {len(names)} tools, stable catalog, structured output, errors")
+        lease = request("tools/call", {"_meta": meta(), "name": "vm_lease", "arguments": {"vm": "dev", "action": "acquire", "owner": "smoke", "ttl": "5m"}})
+        assert json.loads(lease["result"]["content"][0]["text"])["owner"] == "smoke"
+        status = request("tools/call", {"_meta": meta(), "name": "vm_lease", "arguments": {"vm": "dev", "action": "status"}})
+        assert json.loads(status["result"]["content"][0]["text"])["lease"]["owner"] == "smoke"
+        denied = request("tools/call", {"_meta": meta(), "name": "vm_lease", "arguments": {"vm": "dev", "action": "release", "owner": "other"}})
+        assert denied["result"].get("isError") and "vm_leased" in denied["result"]["content"][0]["text"]
+        released = request("tools/call", {"_meta": meta(), "name": "vm_lease", "arguments": {"vm": "dev", "action": "release", "owner": "smoke"}})
+        assert json.loads(released["result"]["content"][0]["text"])["released"] is True
+        print(f"MCP smoke passed: strict revision, discovery, {len(names)} tools, stable catalog, tool output, errors, leases")
     finally:
         process.terminate()
         process.wait(timeout=10)

@@ -11,13 +11,20 @@ public sealed class StateStore
         if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(Root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
     public string Dir(string category, string id) => Path.Combine(Root, Paths.Id(category), Paths.Id(id));
-    public T Read<T>(string category, string id) => File.Exists(Path.Combine(Dir(category, id), "record.json"))
+    public bool Exists(string category, string id) => File.Exists(Path.Combine(Dir(category, id), "record.json"));
+    public T Read<T>(string category, string id) => Exists(category, id)
         ? Wire.Decode<T>(File.ReadAllText(Path.Combine(Dir(category, id), "record.json")))
         : throw new WinixException("not_found", $"No {category} entry named {id}.");
+    public T? TryRead<T>(string category, string id) where T : class => Exists(category, id) ? Read<T>(category, id) : null;
     public void Write<T>(string category, string id, T value)
     {
         var dir = Dir(category, id); Directory.CreateDirectory(dir);
         Atomic(Path.Combine(dir, "record.json"), Wire.Encode(value));
+    }
+    public void Delete(string category, string id)
+    {
+        var dir = Dir(category, id);
+        if (Directory.Exists(dir)) Directory.Delete(dir, true);
     }
     public List<T> List<T>(string category)
     {

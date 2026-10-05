@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Text;
 using Winix;
 
@@ -8,8 +9,20 @@ internal static class Program
 {
     public const string Root = @"C:\Winix";
     public const string Pipe = "winix-desktop-v1";
+    /// <summary>Per-monitor-V2 DPI awareness, so screenshots and coordinates are physical pixels at any scaling.</summary>
+    public static bool DpiAware { get; private set; }
+    /// <summary>A Winix data directory: the provisioned <c>C:\Winix\&lt;name&gt;</c>, or a fallback inside the writable work tree on older images.</summary>
+    public static string Dir(string name)
+    {
+        var provisioned = Path.Combine(Root, Paths.Id(name));
+        if (Directory.Exists(provisioned)) return provisioned;
+        var fallback = Path.Combine(Root, "work", ".winix", name);
+        Directory.CreateDirectory(fallback);
+        return fallback;
+    }
     public static async Task<int> Main(string[] args)
     {
+        try { DpiAware = SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch (Exception e) when (e is EntryPointNotFoundException or DllNotFoundException) { DpiAware = false; }
         try
         {
             if (args is ["ui"])
@@ -32,7 +45,8 @@ internal static class Program
                 Console.WriteLine(await reader.ReadLineAsync());
                 return 0;
             }
-            if (args is not ["worker"]) { Console.Error.WriteLine("winix-guest worker | rpc"); return 2; }
+            if (args is ["elevated"]) return await Elevation.RunPending();
+            if (args is not ["worker"]) { Console.Error.WriteLine("winix-guest worker | rpc | ui | elevated"); return 2; }
             using var instance = new Mutex(true, "Local\\WinixDesktopWorker", out var created);
             if (!created) throw new WinixException("worker_running", "A desktop worker is already running.");
             foreach (var dir in new[] { "work", "jobs", "inbox", "exports" }) Directory.CreateDirectory(Path.Combine(Root, dir));
@@ -68,4 +82,5 @@ internal static class Program
             try { await writer.WriteLineAsync(Wire.Encode(response)); } catch (IOException) { /* Job state is durable even if SSH disconnected. */ }
         }
     }
+    [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(IntPtr context);
 }

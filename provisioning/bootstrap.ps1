@@ -29,6 +29,16 @@ try {
     if (Test-Path "${letter}:\guest-agent\qemu-ga-x86_64.msi") {
       CheckedProcess 'msiexec.exe' "/i ${letter}:\guest-agent\qemu-ga-x86_64.msi /qn /norestart"
     }
+    # The guest-tools MSI leaves QXL and virtio-gpu on the Basic Display Adapter; install their display drivers directly.
+    foreach ($display in @('qxldod', 'viogpudo')) {
+      $inf = Get-ChildItem "${letter}:\$display" -Recurse -Filter *.inf -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\(w11|w10|2k22|2k19)\\amd64\\' } |
+        Sort-Object { switch -Regex ($_.FullName) { '\\w11\\' { 0 } '\\w10\\' { 1 } '\\2k22\\' { 2 } default { 3 } } } | Select-Object -First 1
+      if ($inf) {
+        & pnputil.exe /add-driver $inf.FullName /install | Out-Null
+        if ($LASTEXITCODE -notin @(0, 259, 3010)) { Write-Warning "$display driver install exited $LASTEXITCODE" }
+      }
+    }
     New-Item "$root\drivers.done" -ItemType File -Force | Out-Null
   }
   Status 'ssh'
@@ -43,7 +53,7 @@ try {
   if ($LASTEXITCODE) { throw 'Cannot secure the guest installation directory.' }
   & icacls "$root\authorized_keys" /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' "*$($testUser.SID):R" | Out-Null
   if ($LASTEXITCODE) { throw 'Cannot secure the SSH authorized key.' }
-  foreach ($dir in @('work','jobs','inbox','exports')) {
+  foreach ($dir in @('work','jobs','inbox','exports','elevated','dumps','profiles','cache','launch','tools')) {
     New-Item -ItemType Directory "$root\$dir" -Force | Out-Null
     & icacls "$root\$dir" /grant "*$($testUser.SID):(OI)(CI)M" | Out-Null
     if ($LASTEXITCODE) { throw "Cannot grant the test user access to $dir." }
@@ -86,6 +96,13 @@ Subsystem sftp "$sshDirectory\sftp-server.exe"
   $requiredComponents = (Get-Content "$root\desktop.vsconfig" -Raw | ConvertFrom-Json).components
   $missingComponents = @($requiredComponents | Where-Object { !(& $vswhere -latest -products '*' -requires $_ -property installationPath) })
   if ($missingComponents.Count) { throw "Visual Studio is missing required components: $($missingComponents -join ', ')" }
+  Status 'debloat'
+  if (!(Test-Path "$root\debloat.done")) {
+    & "$root\measure.ps1" -Output "$root\measure-before.json" -Label 'before-debloat'
+    & "$root\debloat.ps1" -Manifest "$root\debloat.json"
+    & "$root\measure.ps1" -Output "$root\measure-after.json" -Label 'after-debloat'
+    New-Item "$root\debloat.done" -ItemType File -Force | Out-Null
+  }
   Status 'desktop'
   New-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Force | Out-Null
   New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Name AllowDevelopmentWithoutDevLicense -Value 1 -PropertyType DWord -Force | Out-Null
@@ -103,6 +120,20 @@ Subsystem sftp "$sshDirectory\sftp-server.exe"
   $principal = New-ScheduledTaskPrincipal -UserId $testUser.SID.Value -LogonType Interactive -RunLevel Limited
   $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
   Register-ScheduledTask -TaskName WinixDesktop -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Force | Out-Null
+  # The explicit elevated path: an on-demand SYSTEM task the test user may start (GRGX in its security descriptor)
+  # but not edit. It runs winix-guest.exe elevated, which handles requests queued under C:\Winix\elevated.
+  $scheduler = New-Object -ComObject Schedule.Service; $scheduler.Connect()
+  $definition = $scheduler.NewTask(0)
+  $definition.RegistrationInfo.Description = 'Winix elevated runner (tasks flagged elevated: true, winix guest driver add)'
+  $definition.Principal.UserId = 'SYSTEM'; $definition.Principal.LogonType = 5; $definition.Principal.RunLevel = 1
+  $definition.Settings.ExecutionTimeLimit = 'PT4H'; $definition.Settings.MultipleInstances = 2; $definition.Settings.AllowDemandStart = $true
+  $definition.Settings.DisallowStartIfOnBatteries = $false; $definition.Settings.StopIfGoingOnBatteries = $false; $definition.Settings.StartWhenAvailable = $true
+  $elevatedAction = $definition.Actions.Create(0); $elevatedAction.Path = "$root\agent\winix-guest.exe"; $elevatedAction.Arguments = 'elevated'; $elevatedAction.WorkingDirectory = $root
+  $sddl = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$($testUser.SID.Value))"
+  $scheduler.GetFolder('\').RegisterTaskDefinition('WinixElevated', $definition, 6, 'SYSTEM', $null, 5, $sddl) | Out-Null
+  if ($settings.nvda -and $settings.nvda.url) {
+    & "$root\nvda.ps1" -Url $settings.nvda.url -Sha256 $settings.nvda.sha256 -InstallDir "$root\tools\nvda" -User winix
+  }
   $certificate = Get-ChildItem Cert:\LocalMachine\My | Where-Object Subject -eq 'CN=Winix Development' | Select-Object -First 1
   if (!$certificate) { $certificate = New-SelfSignedCertificate -Type Custom -Subject 'CN=Winix Development' -KeyUsage DigitalSignature -FriendlyName 'Winix Development' -CertStoreLocation Cert:\LocalMachine\My -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3','2.5.29.19={text}') }
   Export-Certificate -Cert $certificate -FilePath "$root\development.cer" | Out-Null
@@ -112,7 +143,12 @@ Subsystem sftp "$sshDirectory\sftp-server.exe"
   & icacls "$root\development.pfx" /inheritance:r /grant '*S-1-5-18:F' '*S-1-5-32-544:F' "*$($testUser.SID):R" | Out-Null
   if ($LASTEXITCODE) { throw 'Cannot secure the development certificate.' }
   $vs = & $vswhere -latest -products '*' -format json | ConvertFrom-Json
-  @{ready=$true;visualStudio=$vs;dotnet=(& 'C:\Program Files\dotnet\dotnet.exe' --list-sdks);windows=(Get-ComputerInfo -Property WindowsVersion,OsBuildNumber);certificate=$certificate.Thumbprint} | ConvertTo-Json -Depth 12 | Set-Content "$root\toolchain.json"
+  $debloat = if (Test-Path "$root\debloat.json") { Get-Content "$root\debloat.json" -Raw | ConvertFrom-Json } else { $null }
+  $measure = @{}; foreach ($m in @('before', 'after')) { if (Test-Path "$root\measure-$m.json") { $measure[$m] = Get-Content "$root\measure-$m.json" -Raw | ConvertFrom-Json } }
+  $displayDrivers = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue | Select-Object FriendlyName, Status)
+  $nvda = if (Test-Path "$root\nvda.json") { Get-Content "$root\nvda.json" -Raw | ConvertFrom-Json } else { $null }
+  @{ready=$true;visualStudio=$vs;dotnet=(& 'C:\Program Files\dotnet\dotnet.exe' --list-sdks);windows=(Get-ComputerInfo -Property WindowsVersion,OsBuildNumber);certificate=$certificate.Thumbprint;
+    elevated='WinixElevated';displayDrivers=$displayDrivers;debloat=$debloat;measure=$measure;nvda=$nvda} | ConvertTo-Json -Depth 12 | Set-Content "$root\toolchain.json"
   Status 'complete'
   Unregister-ScheduledTask WinixProvision -Confirm:$false
   Disable-LocalUser WinixSetup
