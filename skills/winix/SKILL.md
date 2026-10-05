@@ -7,7 +7,7 @@ description: Build and test Windows desktop applications from Linux through Wini
 
 Use the installed `winix` CLI, or the repository launcher `./winix`. Run `--help` when command details are needed. Project tasks are defined in `winix.yaml`; they execute inside Windows.
 
-Run `doctor --json` before first use. Resolve reported setup prerequisites using the repository's `docs/setup.md`. Image provisioning is a separate, lengthy operation; ordinary build/test work should use an existing image.
+Run `doctor --json` before first use. Resolve reported setup prerequisites using the repository's `docs/setup.md`. Image provisioning is a separate, lengthy operation; ordinary build/test work should use an existing image. After Winix itself changes, `vm health` shows the worker version; `guest update` replaces the worker on the running VM with the published guest (`scripts/publish.sh`) without rebuilding the image.
 
 For an edit/build/test loop:
 

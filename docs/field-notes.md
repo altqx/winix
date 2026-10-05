@@ -53,7 +53,7 @@ Leases (above) plus `run --queue` and `--label`. The MCP server exposes the same
 
 ## Bloat and performance
 
-- `scripts/publish.sh` builds the CLI as a ReadyToRun single binary and `./winix` prefers it; `WINIX_BUILD=Debug` keeps the development build.
+- `scripts/publish.sh` builds the CLI as a ReadyToRun single binary and `./winix` prefers it; `WINIX_BUILD=Debug` keeps the development build. `winix guest update` ships the published guest to a running VM (SSH upload, swap as SYSTEM through the QEMU guest agent, data directories and the `WinixElevated` task created on the way), so an existing image gains new worker features without a rebuild.
 - One SSH connection per VM is reused (OpenSSH `ControlMaster`, socket under `$XDG_RUNTIME_DIR`); `WINIX_SSH_MUX=0` disables it. `vm down` closes it.
 - The Visual Studio developer environment is captured once per VS version and architecture in `C:\Winix\cache` and replayed on later tasks.
 - The MCP host exits with its client (stdin EOF, and a parent-process watchdog); `winix doctor` lists orphaned hosts under `mcp-hosts`.
