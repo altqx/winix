@@ -92,6 +92,13 @@ public sealed partial class TaskSpec
     public bool Detach { get; set; }
     /// <summary>Run through the provisioned <c>WinixElevated</c> SYSTEM task instead of the desktop user. Explicit opt-in; no desktop access.</summary>
     public bool Elevated { get; set; }
+    /// <summary>
+    /// PowerShell run after the task is cancelled, times out or is interrupted by a worker restart (not after a normal exit):
+    /// close the app, restore a profile. Runs as the desktop user in the task's working directory with the task's environment
+    /// and <c>WINIX_TEARDOWN_REASON</c> set to <c>cancelled</c>, <c>timed_out</c> or <c>interrupted</c>.
+    /// </summary>
+    public string? Teardown { get; set; }
+    public int TeardownTimeoutSeconds { get; set; } = 120;
     [GeneratedRegex("^[A-Za-z_][A-Za-z0-9_().]*$")] private static partial Regex EnvName();
     public void Validate()
     {
@@ -104,9 +111,12 @@ public sealed partial class TaskSpec
         foreach (var artifact in Artifacts) Paths.Relative(artifact);
         foreach (var key in Environment.Keys.Concat(Env.Keys)) ValidateEnvName(key);
         if (Detach && Elevated) throw new WinixException("invalid_task", "An elevated task cannot also detach.");
+        if (TeardownTimeoutSeconds is < 1 or > 3600) throw new WinixException("invalid_timeout", "teardownTimeoutSeconds must be 1–3600.");
     }
+    /// <summary>The longest the guest may hold this task: its timeout plus the teardown that may follow it.</summary>
+    [System.Text.Json.Serialization.JsonIgnore, YamlIgnore] public int BudgetSeconds => TimeoutSeconds + (string.IsNullOrWhiteSpace(Teardown) ? 0 : TeardownTimeoutSeconds);
     public static string ValidateEnvName(string key) => EnvName().IsMatch(key) ? key : throw new WinixException("invalid_env", $"Invalid environment variable name: {key}");
-    /// <summary>The task as submitted: <c>env</c> and <c>environment</c> merged, then per-run values applied.</summary>
+    /// <summary>The task as submitted: <c>env</c> and <c>environment</c> merged, then per-run values (environment, arguments, timeout) applied.</summary>
     public TaskSpec Effective(RunParameters? parameters)
     {
         var environment = new Dictionary<string, string>(Environment);
@@ -115,8 +125,9 @@ public sealed partial class TaskSpec
         return new TaskSpec
         {
             Executable = Executable, Arguments = [.. Arguments, .. parameters?.Args ?? []], Script = Script, ScriptFile = ScriptFile,
-            WorkingDirectory = WorkingDirectory, TimeoutSeconds = TimeoutSeconds, VisualStudio = VisualStudio, Architecture = Architecture,
-            Environment = environment, Artifacts = [.. Artifacts], Detach = Detach, Elevated = Elevated
+            WorkingDirectory = WorkingDirectory, TimeoutSeconds = parameters?.TimeoutSeconds ?? TimeoutSeconds, VisualStudio = VisualStudio, Architecture = Architecture,
+            Environment = environment, Artifacts = [.. Artifacts], Detach = Detach, Elevated = Elevated,
+            Teardown = Teardown, TeardownTimeoutSeconds = TeardownTimeoutSeconds
         };
     }
 }

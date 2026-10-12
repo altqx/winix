@@ -25,10 +25,15 @@ public sealed class GuestConnection(VmRecord vm, ICommandRunner runner)
         if (Multiplex) options.AddRange(["-o", "ControlMaster=auto", "-o", "ControlPath=" + ControlPath(), "-o", "ControlPersist=600"]);
         return options;
     }
+    /// <summary>
+    /// One request to the desktop worker. A call already in flight is not torn down by <paramref name="ct"/>: interrupting the
+    /// client must not cut a job start, a sync or a UI step in half. Cancellation is honoured before the call; a result that arrives is returned (a started job keeps its ID).
+    /// </summary>
     public async Task<JsonElement> Call(string method, object arguments, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         var result = await runner.Run("ssh", Options().Concat(["winix@127.0.0.1", "C:/Winix/agent/winix-guest.exe rpc"]),
-            Wire.Encode(new GuestRequest(method, Wire.Element(arguments))) + "\n", cancellationToken: ct);
+            Wire.Encode(new GuestRequest(method, Wire.Element(arguments))) + "\n", cancellationToken: CancellationToken.None);
         if (result.ExitCode != 0) throw new WinixException("transport_error", $"Windows SSH failed ({result.ExitCode}): {result.Stderr.Trim()}");
         var response = Wire.Decode<GuestResponse>(result.Stdout);
         if (!response.Ok) throw new WinixException(response.Code ?? "guest_error", response.Error ?? "Windows operation failed.");

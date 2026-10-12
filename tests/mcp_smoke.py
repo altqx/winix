@@ -37,9 +37,13 @@ with tempfile.TemporaryDirectory(prefix="winix-mcp-") as state:
         names = [tool["name"] for tool in tools]
         assert len(names) == len(set(names))
         assert {"job_start", "job_wait", "job_dump", "desktop_action", "desktop_screenshot", "workspace_sync", "workspace_push", "workspace_pull",
-                "vm_lease", "vm_device", "vm_devices", "guest_driver_add"} <= set(names)
-        start = next(tool for tool in tools if tool["name"] == "job_start")["inputSchema"]["properties"]
-        assert {"env", "args", "label", "queueSeconds", "owner"} <= set(start)
+                "vm_lease", "vm_device", "vm_devices", "vm_snapshot", "guest_driver_add", "guest_restart"} <= set(names)
+        def properties(name):
+            return set(next(tool for tool in tools if tool["name"] == name)["inputSchema"]["properties"])
+        assert {"env", "args", "timeoutSeconds", "workspace", "label", "queueSeconds", "owner"} <= properties("job_start")
+        assert {"wait", "waitTimeout", "idle"} <= properties("vm_lease")
+        assert {"force", "owner"} <= properties("job_cancel")
+        assert "workspace" in properties("workspace_sync")
         assert request("tools/list", {"_meta": meta()})["result"]["tools"] == tools
         wrong = request("tools/list", {"_meta": meta("2025-11-25")})
         assert "error" in wrong
@@ -52,7 +56,8 @@ with tempfile.TemporaryDirectory(prefix="winix-mcp-") as state:
         lease = request("tools/call", {"_meta": meta(), "name": "vm_lease", "arguments": {"vm": "dev", "action": "acquire", "owner": "smoke", "ttl": "5m"}})
         assert json.loads(lease["result"]["content"][0]["text"])["owner"] == "smoke"
         status = request("tools/call", {"_meta": meta(), "name": "vm_lease", "arguments": {"vm": "dev", "action": "status"}})
-        assert json.loads(status["result"]["content"][0]["text"])["lease"]["owner"] == "smoke"
+        status = json.loads(status["result"]["content"][0]["text"])
+        assert status["lease"]["owner"] == "smoke" and status["waiting"] == [] and status["lease"]["idleSeconds"] == 1800
         denied = request("tools/call", {"_meta": meta(), "name": "vm_lease", "arguments": {"vm": "dev", "action": "release", "owner": "other"}})
         assert denied["result"].get("isError") and "vm_leased" in denied["result"]["content"][0]["text"]
         released = request("tools/call", {"_meta": meta(), "name": "vm_lease", "arguments": {"vm": "dev", "action": "release", "owner": "smoke"}})

@@ -16,12 +16,14 @@ Follow [setup](docs/setup.md) to download Windows directly from Microsoft and pr
 
 ```sh
 ./winix vm up dev --wait
-./winix lease acquire --owner gate --ttl 2h      # optional: several agents, one VM
-./winix sync .                                   # incremental; one-line summary
-./winix run build --wait --env CONFIG=Release --label gate
+./winix lease acquire --owner gate --wait        # optional: several agents, one VM (queued, first come first served)
+./winix sync . --workspace docking               # incremental; records commit, branch, dirty; a work tree per branch
+./winix run build --wait --env CONFIG=Release --label gate --timeout 20m --workspace docking
 ./winix run test --json --arg --filter=Dock
 ./winix job logs <job-id> --follow
 ./winix job wait <job-id> --artifacts out/evidence
+./winix job cancel <job-id>                      # escalates: cancel, kill the tree, restart the worker
+./winix vm revert baseline --restart             # back to a vm snapshot before the next evidence run
 ./winix ui launch --exe 'C:\Winix\work\app\build\Debug\App.exe' --arg --demo --env QT_SCALE_FACTOR=1.5 --fresh-profile
 ./winix ui windows --pid 1234                    # every top-level and owned window
 ./winix ui focus --pid 1234 --window "Placement"
@@ -31,11 +33,11 @@ Follow [setup](docs/setup.md) to download Windows directly from Microsoft and pr
 ./winix pull '%TEMP%\app.log' artifacts/app.log
 ```
 
-Configure executable/argument, inline `script` or `scriptFile` tasks in `winix.yaml`. Task working directories and artifact paths are relative to `C:\Winix\work\<workspace>`. Artifact entries are exact files/directories, not globs. `detach: true` lets an app a task starts outlive it; `elevated: true` runs it through the provisioned SYSTEM task. `vm:` declares audio, monitors and USB devices; `vm device add usb-audio --job <id> --marker READY` hot-plugs on a log marker. Builds use NTFS and preserve unchanged source mtimes for incremental compilation.
+Configure executable/argument, inline `script` or `scriptFile` tasks in `winix.yaml`. Task working directories and artifact paths are relative to `C:\Winix\work\<workspace>`. Artifact entries are exact files/directories, not globs. `detach: true` lets an app a task starts outlive it; `elevated: true` runs it through the provisioned SYSTEM task; `teardown:` runs after a cancel, timeout or worker restart. `vm:` declares audio, monitors and USB devices; `vm device add usb-audio --job <id> --marker READY` hot-plugs on a log marker. Builds use NTFS and preserve unchanged source mtimes for incremental compilation.
 
 Sync never copies `.git`, `.winix`, `bin`, `obj`, anything git ignores, or the default secret patterns `.env`, `*.pfx`, `*.key` (extend with `exclude:`). Files outside the tree move with `push`/`pull`, hash-verified.
 
-All operations accept `--json`; multi-step commands emit one object per line with a `type`. Jobs survive caller disconnection: `run --wait` retries a lost connection for ten minutes and then exits 4 with the job still running. Query the recorded job ID instead of submitting twice. `ci` uses a fresh overlay and retrieves a ZIP per task before destroying the instance. Infrastructure failures retain the VM for recovery. See [docs/field-notes.md](docs/field-notes.md) for the full list of behaviours added for the HikariSub gate and why.
+All operations accept `--json`; multi-step commands emit one object per line with a `type`. Jobs survive caller disconnection and interrupts: `run --wait` retries a lost connection for ten minutes and then exits 4 with the job still running, and Ctrl-C never cancels a guest job. A job running past its timeout is stopped by the host. Query the recorded job ID instead of submitting twice. `ci` uses a fresh overlay and retrieves a ZIP per task before destroying the instance. Infrastructure failures retain the VM for recovery. See [docs/field-notes.md](docs/field-notes.md) for the full list of behaviours added for the HikariSub gate and why, including the 0.2.1 changes for shared VMs.
 
 The [agent skill](skills/winix/SKILL.md) describes the operational workflow. For a compatible MCP client, configure a stdio command pointing to the published binary with `args: ["mcp"]` (or the absolute repository launcher). Winix explicitly rejects old initialization handshakes. Desktop screenshots return MCP image content. Long tasks use explicit job IDs and polling; `job_wait` blocks with the same reconnect logic as the CLI. The host exits with its client; `doctor` reports orphaned hosts. Run `scripts/publish.sh` for the ReadyToRun binary that `./winix` prefers, then `./winix guest update` to put the matching worker on a running VM.
 

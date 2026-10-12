@@ -155,6 +155,76 @@ public sealed class VmManager(StateStore store, ICommandRunner runner)
         if (await Status(name) != "undefined") await Virsh("undefine", "winix-" + name, "--nvram", "--tpm");
         Directory.Delete(vm.Directory, true);
     }
+    // ---- Snapshots: internal qcow2 snapshots of the VM's overlay plus copies of its firmware variables and TPM state. ----
+    private string SnapshotDir(string vm, string name) => Path.Combine(store.Dir("vms", vm), "snapshots", Paths.Id(name));
+    private async Task<VmRecord> ShutOff(string vm)
+    {
+        var record = store.Read<VmRecord>("vms", vm);
+        if (await Status(vm) is not ("shut off" or "undefined"))
+            throw new WinixException("vm_running", $"VM {vm} is running. Snapshots are taken and restored with the VM shut off (a consistent disk, firmware and TPM); run vm down first.");
+        return record;
+    }
+    public async Task<SnapshotRecord> Snapshot(string vm, string name, string? note = null)
+    {
+        Paths.Id(name);
+        using var guard = store.Lock();
+        var record = await ShutOff(vm);
+        var dir = SnapshotDir(vm, name);
+        if (Directory.Exists(dir)) throw new WinixException("snapshot_exists", $"Snapshot {name} of {vm} exists; delete it first.");
+        var disk = Path.Combine(record.Directory, "disk.qcow2");
+        await runner.Checked("qemu-img", ["snapshot", "-c", "winix-" + name, disk]);
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.Copy(Path.Combine(record.Directory, "nvram.fd"), Path.Combine(dir, "nvram.fd"));
+            if (Directory.Exists(Path.Combine(record.Directory, "tpm"))) CopyTree(Path.Combine(record.Directory, "tpm"), Path.Combine(dir, "tpm"));
+            var snapshot = new SnapshotRecord(name, vm, DateTimeOffset.UtcNow, note);
+            StateStore.Atomic(Path.Combine(dir, "record.json"), Wire.Encode(snapshot));
+            return snapshot;
+        }
+        catch
+        {
+            await runner.Run("qemu-img", ["snapshot", "-d", "winix-" + name, disk]);
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            throw;
+        }
+    }
+    public List<SnapshotRecord> Snapshots(string vm)
+    {
+        store.Read<VmRecord>("vms", vm);
+        var root = Path.Combine(store.Dir("vms", vm), "snapshots");
+        return !Directory.Exists(root) ? [] : Directory.GetDirectories(root).Select(d => Path.Combine(d, "record.json")).Where(File.Exists)
+            .Select(f => Wire.Decode<SnapshotRecord>(File.ReadAllText(f))).OrderBy(r => r.CreatedAt).ToList();
+    }
+    public async Task Revert(string vm, string name)
+    {
+        using var guard = store.Lock();
+        var record = await ShutOff(vm);
+        var dir = SnapshotDir(vm, name);
+        if (!File.Exists(Path.Combine(dir, "record.json"))) throw new WinixException("snapshot_missing", $"No snapshot {name} of {vm}; see vm snapshot list.");
+        await runner.Checked("qemu-img", ["snapshot", "-a", "winix-" + name, Path.Combine(record.Directory, "disk.qcow2")]);
+        File.Copy(Path.Combine(dir, "nvram.fd"), Path.Combine(record.Directory, "nvram.fd"), true);
+        var tpm = Path.Combine(record.Directory, "tpm");
+        if (Directory.Exists(Path.Combine(dir, "tpm")))
+        {
+            if (Directory.Exists(tpm)) Directory.Delete(tpm, true);
+            CopyTree(Path.Combine(dir, "tpm"), tpm);
+        }
+        // Hot-plugged devices did not survive the power-off; the record must not claim them.
+        if (File.Exists(DevicesFile(vm))) File.Delete(DevicesFile(vm));
+    }
+    public async Task SnapshotDelete(string vm, string name)
+    {
+        using var guard = store.Lock();
+        var record = store.Read<VmRecord>("vms", vm);
+        var dir = SnapshotDir(vm, name);
+        if (!Directory.Exists(dir)) throw new WinixException("snapshot_missing", $"No snapshot {name} of {vm}.");
+        // Deleting an internal snapshot rewrites the image's metadata, so the VM must be off for it as well.
+        await ShutOff(vm);
+        await runner.Checked("qemu-img", ["snapshot", "-d", "winix-" + name, Path.Combine(record.Directory, "disk.qcow2")]);
+        Directory.Delete(dir, true);
+    }
+
     public static void CopyTree(string from, string to)
     {
         Directory.CreateDirectory(to);

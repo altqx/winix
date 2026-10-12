@@ -33,10 +33,17 @@ public sealed class StateStore
             .Where(d => File.Exists(Path.Combine(d, "record.json")))
             .Select(d => Wire.Decode<T>(File.ReadAllText(Path.Combine(d, "record.json")))).ToList();
     }
-    public FileStream Lock()
+    public FileStream Lock() => Lock(TimeSpan.Zero);
+    /// <summary>Takes the state lock, retrying for up to <paramref name="wait"/> for holders that only need it briefly (lease bookkeeping).</summary>
+    public FileStream Lock(TimeSpan wait)
     {
-        try { return new FileStream(Path.Combine(Root, "state.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
-        catch (IOException) { throw new WinixException("busy", "Another Winix operation is changing VM state. Retry shortly."); }
+        var until = DateTime.UtcNow + wait;
+        while (true)
+        {
+            try { return new FileStream(Path.Combine(Root, "state.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+            catch (IOException) when (DateTime.UtcNow < until) { Thread.Sleep(50); }
+            catch (IOException) { throw new WinixException("busy", "Another Winix operation is changing VM state. Retry shortly."); }
+        }
     }
     public static void Atomic(string path, string text)
     {

@@ -21,13 +21,16 @@ internal sealed class Dispatcher : IDisposable
         switch (request.Method)
         {
             case "health":
-                return new { version = "0.2.0", user = System.Environment.UserName, interactive = System.Environment.UserInteractive,
+                return new { version = WinixVersion.Current, user = System.Environment.UserName, interactive = System.Environment.UserInteractive,
                     desktopReady = Desktop.IsUnlocked(), activeJob = jobs.Active, dpiAware = Program.DpiAware, elevationAvailable = Elevation.Available,
-                    features = new[] { "windows", "focus", "state", "batch", "monitors", "keys-scancode", "launch-env", "push-pull", "dump", "elevated", "incremental-sync" },
+                    features = new[] { "windows", "focus", "state", "batch", "monitors", "keys-scancode", "launch-env", "push-pull", "dump", "elevated", "incremental-sync",
+                        "cancel-force", "teardown", "run-timeout", "sync-source", "workspaces", "shared-cache" },
                     toolchain = File.Exists(@"C:\Winix\toolchain.json") ? Wire.Decode<JsonElement>(File.ReadAllText(@"C:\Winix\toolchain.json")) : Wire.Element(new { }) };
             case "job.status": return jobs.Status(id);
             case "job.logs": return jobs.Logs(id, a.TryGetProperty("offset", out var offset) ? offset.GetInt64() : 0);
-            case "job.cancel": return jobs.Cancel(id);
+            case "job.cancel":
+                return jobs.Cancel(id, a.TryGetProperty("force", out var force) && force.GetBoolean(),
+                    a.TryGetProperty("reason", out var reason) && reason.ValueKind == JsonValueKind.String ? reason.GetString() : null);
             case "job.export": return jobs.Export(id);
             case "process.kill":
             {

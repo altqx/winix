@@ -19,11 +19,18 @@ internal static class Entry
             var configFile = Path.GetFullPath(args.Option("config") ?? "winix.yaml");
             var root = Path.GetDirectoryName(configFile)!;
             using var cancel = new CancellationTokenSource();
-            Console.CancelKeyPress += (_, e) => { e.Cancel = true; cancel.Cancel(); };
+            // The first Ctrl-C stops waiting once the call in flight returns; nothing on the guest is cancelled. A second one exits at once.
+            Console.CancelKeyPress += (_, e) =>
+            {
+                if (cancel.IsCancellationRequested) return;
+                e.Cancel = true; cancel.Cancel();
+                Console.Error.WriteLine("Interrupted: finishing the current guest call; jobs on the guest keep running. Press Ctrl-C again to exit now.");
+            };
             var ct = cancel.Token;
             object result;
             switch (args.Word(0))
             {
+                case "version": result = new { version = WinixVersion.Current }; break;
                 case "init":
                     if (File.Exists(configFile)) throw new WinixException("config_exists", "Configuration already exists.");
                     File.WriteAllText(configFile, DefaultConfig); result = new { config = configFile }; break;
@@ -46,7 +53,7 @@ internal static class Entry
                         _ => throw new WinixException("usage", "image build|seal|list|status")
                     }; break;
                 case "vm":
-                    var name = args.Words.Count > 2 && args.Word(1) != "device" ? args.Word(2) : vm;
+                    var name = args.Words.Count > 2 && args.Word(1) is not ("device" or "snapshot" or "revert") ? args.Word(2) : vm;
                     switch (args.Word(1))
                     {
                         case "up":
@@ -79,7 +86,17 @@ internal static class Entry
                                 _ => throw new WinixException("usage", "vm device add DRIVER [--id ID] [--props k=v,..] | remove ID | list  (--job ID --marker TEXT, --delay 5s)")
                             };
                             break;
-                        default: throw new WinixException("usage", "vm up|down|delete|status|list|ready|health|trust|devices [name] | vm device add|remove|list");
+                        case "snapshot":
+                            result = args.Word(2) switch
+                            {
+                                "create" => await service.Snapshot(vm, args.Word(3), args.Option("note"), owner),
+                                "list" => service.Vms.Snapshots(vm),
+                                "delete" => await service.SnapshotDelete(vm, args.Word(3), owner),
+                                _ => throw new WinixException("usage", "vm snapshot create NAME [--note TEXT] | list | delete NAME   (VM shut off; --vm NAME)")
+                            };
+                            break;
+                        case "revert": result = await service.Revert(vm, args.Word(2), owner, args.Flag("restart"), configFile, ct); break;
+                        default: throw new WinixException("usage", "vm up|down|delete|status|list|ready|health|trust|devices [name] | vm device add|remove|list | vm snapshot create|list|delete | vm revert NAME");
                     }
                     break;
                 case "console":
@@ -88,24 +105,28 @@ internal static class Entry
                 case "lease":
                     result = args.Word(1) switch
                     {
-                        "acquire" => service.Acquire(vm, owner ?? throw new WinixException("usage", "lease acquire needs --owner NAME (or WINIX_OWNER)."), Paths.Duration(args.Option("ttl") ?? "2h"), args.Option("note")),
+                        "acquire" when args.Flag("wait") => await service.AcquireWait(vm, owner ?? throw new WinixException("usage", "lease acquire needs --owner NAME (or WINIX_OWNER)."),
+                            Paths.Duration(args.Option("ttl") ?? "2h"), args.Option("note"), Idle(args), Paths.Duration(args.Option("timeout") ?? "4h"), ct),
+                        "acquire" => service.Acquire(vm, owner ?? throw new WinixException("usage", "lease acquire needs --owner NAME (or WINIX_OWNER)."), Paths.Duration(args.Option("ttl") ?? "2h"), args.Option("note"), Idle(args)),
                         "release" => service.Release(vm, owner, args.Flag("force")),
-                        "status" => new { vm, lease = service.Lease(vm) },
-                        _ => throw new WinixException("usage", "lease acquire --owner NAME [--ttl 2h] [--note TEXT] | release [--force] | status")
+                        "status" => service.LeaseStatus(vm),
+                        _ => throw new WinixException("usage", "lease acquire --owner NAME [--ttl 2h] [--idle 30m] [--note TEXT] [--wait [--timeout 4h]] | release [--force] | status")
                     };
                     break;
                 case "sync":
                 {
-                    var sync = await service.Sync(vm, args.Words.Count > 1 ? Path.GetFullPath(args.Word(1)) : root, configFile, owner, args.Flag("full"), ct);
+                    var sync = await service.Sync(vm, args.Words.Count > 1 ? Path.GetFullPath(args.Word(1)) : root, configFile, owner, args.Flag("full"), args.Option("workspace"), ct);
                     if (json) Print(Wire.Typed("sync", sync), true); else Console.WriteLine(sync.Summary);
+                    if (sync.BranchChanged && args.Option("workspace") is null)
+                        Console.Error.WriteLine($"Note: workspace {sync.Workspace} last held {sync.Previous!.Describe}. Agents on different branches should each sync into their own: --workspace NAME.");
                     return 0;
                 }
                 case "push": result = await service.Push(vm, args.Word(1), args.Word(2), owner, ct); break;
                 case "pull": result = await service.Pull(vm, args.Word(1), args.Word(2), owner, ct); break;
                 case "run":
                 {
-                    var queue = args.Flag("queue") ? Paths.Duration(args.Option("timeout") ?? "1h") : (TimeSpan?)null;
-                    var started = await service.Run(vm, configFile, args.Word(1), Parameters(args), args.Option("label"), owner, queue, ct);
+                    var queue = args.Flag("queue") ? Paths.Duration(args.Option("queue-timeout") ?? "1h") : (TimeSpan?)null;
+                    var started = await service.Run(vm, configFile, args.Word(1), Parameters(args), args.Option("label"), owner, queue, args.Option("workspace"), ct);
                     if (!args.Flag("wait")) { PrintJob(started, service, json); return 0; }
                     // The ID goes out first so a caller that loses this process can still find its job.
                     if (json) Print(Wire.Typed("started", new { id = started.Id, vm, label = started.Label }), true);
@@ -124,7 +145,7 @@ internal static class Entry
                             PrintJob(record, service, json); return record.State == JobState.Succeeded ? 0 : 1;
                         }
                         case "status": PrintJob(await service.Job(args.Word(2), "status", ct: ct), service, json); return 0;
-                        case "cancel": result = await service.Job(args.Word(2), "cancel", ct: ct); break;
+                        case "cancel": result = await service.Cancel(args.Word(2), args.Flag("force"), owner, ct); break;
                         case "logs": return await Logs(service, args.Word(2), long.Parse(args.Option("offset") ?? "0"), args.Flag("follow"), args.Flag("all"), json, ct);
                         case "artifacts":
                             result = args.Option("path") is { } guestPath
@@ -155,7 +176,8 @@ internal static class Entry
                     if (args.Word(1) == "driver" && args.Word(2) == "add") result = await service.Elevated(vm, "driver-add", new { inf = args.Word(3) }, owner, ct);
                     else if (args.Word(1) == "update")
                         result = await service.UpdateGuest(vm, Path.GetFullPath(args.Option("guest") ?? new[] { "artifacts/release/guest", "artifacts/guest" }.FirstOrDefault(d => File.Exists(Path.Combine(d, "winix-guest.exe"))) ?? "artifacts/guest"), owner, ct);
-                    else throw new WinixException("usage", "guest driver add GUEST_INF_PATH | guest update [--guest DIR]");
+                    else if (args.Word(1) == "restart") result = await service.GuestRestart(vm, owner, ct);
+                    else throw new WinixException("usage", "guest driver add GUEST_INF_PATH | guest update [--guest DIR] | guest restart");
                     break;
                 case "ci":
                     result = await service.Ci(configFile, root, args.Option("output") ?? "artifacts/runs", ct);
@@ -175,12 +197,10 @@ internal static class Entry
         }
     }
     private static void Print(object value, bool json) => Console.WriteLine(JsonSerializer.Serialize(value, new JsonSerializerOptions(Wire.Json) { WriteIndented = !json }));
-    /// <summary>A job record with its VM and local-time stamps (guest clocks are UTC).</summary>
+    /// <summary>A job record with its VM, owner, source, elapsed time against the timeout, and local-time stamps (guest clocks are UTC).</summary>
     private static void PrintJob(object record, WinixService service, bool json)
     {
-        var view = Wire.Typed("job", record);
-        var id = view.TryGetValue("id", out var idValue) && idValue is JsonElement e ? e.GetString() : null;
-        if (id is not null && service.Store.Exists("jobs", id)) view["vm"] = service.HostJob(id).Vm;
+        var view = service.Describe(record);
         foreach (var key in new[] { "createdAt", "finishedAt" })
             if (view.TryGetValue(key, out var value) && value is JsonElement { ValueKind: JsonValueKind.String } stamp && DateTimeOffset.TryParse(stamp.GetString(), out var when))
                 view[key + "Local"] = when.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz");
@@ -215,8 +235,10 @@ internal static class Entry
         var env = new Dictionary<string, string>();
         foreach (var (key, value) in Pairs(args.Multi("env"))) env[TaskSpec.ValidateEnvName(key)] = value;
         var list = args.Multi("arg");
-        return env.Count == 0 && list.Count == 0 ? null : new(env, list);
+        int? timeout = args.Option("timeout") is { } t ? (int)Paths.Duration(t).TotalSeconds : null;
+        return env.Count == 0 && list.Count == 0 && timeout is null ? null : new(env, list, timeout);
     }
+    private static TimeSpan? Idle(Arguments args) => args.Option("idle") is { } idle ? Paths.Duration(idle) : null;
     private static Dictionary<string, string> Pairs(string? csv) => Pairs(csv is null ? [] : csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList());
     private static Dictionary<string, string> Pairs(List<string> items)
     {
@@ -275,15 +297,21 @@ Winix — Windows build and desktop testing from Linux
   vm device add DRIVER|remove ID  Hot-plug (usb-audio, usb-kbd, usb-mouse, usb-tablet, usb-hub, usb-host)
      [--id ID] [--props k=v,..] [--job ID --marker TEXT] [--delay 5s]   Trigger on a job-log marker
   vm device list                  QEMU peripherals and Winix-tracked hot-plugs
-  lease acquire --owner NAME      Hold the VM (--ttl 2h, --note TEXT); honoured by sync, run, ui, vm down
-  lease release [--force] | status
+  vm snapshot create NAME         Snapshot disk, firmware and TPM of a shut-off VM (--note TEXT); list | delete NAME
+  vm revert NAME [--restart]      Return to a snapshot (--restart: shut down, revert, start and wait for the desktop)
+  lease acquire --owner NAME      Hold the VM (--ttl 2h, --idle 30m, --note TEXT); honoured by sync, run, ui, vm down
+     [--wait [--timeout 4h]]      Queue for a held VM, first come first served
+  lease release [--force] | status   Status lists the queue; leases end when idle and after WINIX_LEASE_MAX_TTL (8h)
   console --vm NAME               Open the virtual display
-  sync [DIRECTORY] [--full]       Copy working-tree changes into Windows (incremental; one-line summary)
+  sync [DIRECTORY] [--full]       Copy working-tree changes into Windows (incremental; records commit, branch, dirty)
+     [--workspace NAME]           A separate guest work tree, e.g. one per branch (or WINIX_WORKSPACE)
   push HOST_PATH GUEST_PATH       Copy a file or directory into the guest, outside the synced tree
   pull GUEST_PATH HOST_PATH       Copy a guest file or directory back (hashes verified)
   run TASK [--wait]               Start a durable build/test task
-     [--env K=V]... [--arg V]... [--label NAME] [--queue [--timeout 1h]] [--artifacts DIR]
-  job status|logs|wait|cancel ID   Inspect/cancel work (logs: --offset BYTES, --follow, --all)
+     [--env K=V]... [--arg V]... [--timeout 20m] [--label NAME] [--workspace NAME]
+     [--queue [--queue-timeout 1h]] [--artifacts DIR]
+  job status|logs|wait ID          Inspect work (status: elapsed vs timeout; logs: --offset BYTES, --follow, --all)
+  job cancel ID [--force]         Cancel; escalates to killing the tree, then restarting the worker
   job artifacts ID [--output DIR] Retrieve logs, reports and binaries as ZIP (--path GUEST_PATH for one file)
   job wait ID [--artifacts DIR]   Wait, then download the ZIP
   job dump --pid N [--full]       Minidump + thread stacks (cdb) of a guest process
@@ -292,6 +320,8 @@ Winix — Windows build and desktop testing from Linux
                                  kill, dump, batch, pointer, drag, calibrate, deploy, uninstall
   guest driver add GUEST_INF      Install a driver through the provisioned elevated task
   guest update [--guest DIR]      Replace the worker on a running VM with a published guest (via QEMU guest agent)
+  guest restart                   Restart a stuck worker (via QEMU guest agent); unfinished jobs end, teardown runs
+  version                         Print the Winix version
   ci                              Clean overlay → sync → pipeline → export → cleanup
   mcp                             Strict MCP 2026-07-28 stdio server
 
@@ -303,6 +333,7 @@ UI: --exe PATH --app-id ID --pid N --window TITLE|INDEX|hwnd:N --automation-id I
     drag FROM TO (x,y pairs); calibrate --point x,y; batch --file steps.json [--continue-on-error]
 Image default: windows-dev. VM default: dev. Config default: ./winix.yaml.
 Exit: 0 success, 1 task/test failure, 2 invalid usage, 3 infrastructure, 4 contact lost (job still running), 130 interrupted.
+Ctrl-C never cancels a guest job; the call in flight finishes first, a second Ctrl-C exits at once.
 """;
     private const string DefaultConfig = """
 version: 1
@@ -332,7 +363,8 @@ tasks:
     timeoutSeconds: 600
     artifacts: [build/results.xml]
 # Other task keys: scriptFile (PowerShell file in the workspace), env/environment, workingDirectory,
-# detach (started apps outlive the task), elevated (runs through the SYSTEM task; no desktop).
+# detach (started apps outlive the task), elevated (runs through the SYSTEM task; no desktop),
+# teardown (PowerShell run after a cancel, timeout or worker restart) with teardownTimeoutSeconds (120).
 """;
 }
 
@@ -341,9 +373,10 @@ internal sealed class Arguments
     public List<string> Words { get; } = [];
     private readonly Dictionary<string, string?> options = [];
     private readonly Dictionary<string, List<string>> multi = [];
-    private static readonly HashSet<string> Flags = ["json", "help", "wait", "force", "follow", "all", "queue", "hold", "release", "full", "no-console", "fresh-profile", "include-hidden", "continue-on-error", "single"];
+    private static readonly HashSet<string> Flags = ["json", "help", "wait", "force", "follow", "all", "queue", "hold", "release", "full", "no-console", "fresh-profile", "include-hidden", "continue-on-error", "single", "restart"];
     private static readonly HashSet<string> Values = ["home", "vm", "config", "iso", "guest", "edition", "name", "output", "offset", "args", "exe", "app-id", "pid", "automation-id", "text", "keys",
-        "window", "monitor", "cwd", "button", "path", "point", "map", "steps", "delay", "timeout", "depth", "limit", "backend", "label", "owner", "ttl", "note", "id", "props", "job", "marker", "file", "artifacts", "nvda-url", "nvda-sha256"];
+        "window", "monitor", "cwd", "button", "path", "point", "map", "steps", "delay", "timeout", "depth", "limit", "backend", "label", "owner", "ttl", "note", "id", "props", "job", "marker", "file", "artifacts", "nvda-url", "nvda-sha256",
+        "workspace", "idle", "queue-timeout"];
     private static readonly HashSet<string> Repeatable = ["env", "arg"];
     public Arguments(string[] args)
     {

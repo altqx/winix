@@ -17,18 +17,31 @@ public static class WorkspaceSync
     public static async Task<SyncManifest> Pack(ICommandRunner runner, string root, string workspace, IEnumerable<string> excludes, string zipPath)
         => (await PackIncremental(runner, root, workspace, excludes, zipPath, null)).Manifest;
 
+    /// <summary>The commit, branch and dirty flag of the tree being synced. No commit yet, or not a repository: commit is null.</summary>
+    public static async Task<SourceInfo> Source(ICommandRunner runner, string root)
+    {
+        root = Path.GetFullPath(root);
+        var head = await runner.Run("git", ["-C", root, "rev-parse", "--verify", "-q", "HEAD"]);
+        var branch = await runner.Run("git", ["-C", root, "symbolic-ref", "-q", "--short", "HEAD"]);
+        var status = await runner.Run("git", ["-C", root, "status", "--porcelain", "--untracked-files=normal"]);
+        return new(head.ExitCode == 0 && head.Stdout.Trim().Length > 0 ? head.Stdout.Trim() : null,
+            branch.ExitCode == 0 && branch.Stdout.Trim().Length > 0 ? branch.Stdout.Trim() : null,
+            status.ExitCode != 0 || status.Stdout.Trim().Length > 0);
+    }
+
     /// <summary>
     /// Packs the working tree. With <paramref name="previous"/> (what the guest already holds), only files whose
     /// content changed are included; the manifest still lists every file so the guest can verify and prune.
     /// Files whose size and mtime match the previous state are not rehashed.
     /// </summary>
-    public static async Task<PackResult> PackIncremental(ICommandRunner runner, string root, string workspace, IEnumerable<string> excludes, string zipPath, SyncState? previous)
+    public static async Task<PackResult> PackIncremental(ICommandRunner runner, string root, string workspace, IEnumerable<string> excludes, string zipPath, SyncState? previous,
+        SourceInfo? origin = null)
     {
         root = Path.GetFullPath(root); Paths.Id(workspace);
         var result = await runner.Run("git", ["-C", root, "ls-files", "--cached", "--others", "--exclude-standard", "-z"]);
         if (result.ExitCode != 0) throw new WinixException("git_failed", result.Stderr);
         var files = result.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries).Distinct().ToList();
-        var manifest = new SyncManifest(workspace, []);
+        var manifest = new SyncManifest(workspace, [], origin);
         var stats = new Dictionary<string, FileStat>();
         var held = previous?.Manifest.Files.ToDictionary(f => f.Path, f => f.Sha256) ?? [];
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

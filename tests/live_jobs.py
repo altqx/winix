@@ -20,6 +20,10 @@ with tempfile.TemporaryDirectory(prefix="winix-live-") as directory:
         "failure": {"script": "Write-Output 'expected failure'; exit 17"},
         "cancel": {"script": "$p = Start-Process powershell.exe -ArgumentList '-NoProfile -Command Start-Sleep -Seconds 90' -PassThru; $p.Id | Set-Content child.txt; Write-Output 'child started'; Start-Sleep -Seconds 90"},
         "timeout": {"script": "Start-Sleep -Seconds 90", "timeoutSeconds": 3},
+        # A detached child that inherits the wrapper's output pipes used to keep the job "running" forever.
+        "held": {"script": "Start-Process powershell.exe -NoNewWindow -ArgumentList '-NoProfile -Command Start-Sleep -Seconds 120'; Write-Output 'pipe holder started'", "detach": True, "timeoutSeconds": 60},
+        "teardown": {"script": "Start-Sleep -Seconds 90", "timeoutSeconds": 3, "teardown": "Write-Output \"teardown $env:WINIX_TEARDOWN_REASON\""},
+        "slow": {"script": "Start-Sleep -Seconds 90"},
         "verify": {"script": "$child = [int](Get-Content child.txt); if (Get-Process -Id $child -ErrorAction SilentlyContinue) { throw 'Cancelled child survived' }; Write-Output 'child terminated'"},
     }
     for task in tasks.values():
@@ -32,7 +36,9 @@ with tempfile.TemporaryDirectory(prefix="winix-live-") as directory:
         assert result.returncode == expected, (words, result.returncode, result.stdout, result.stderr)
         return json.loads(result.stdout)
 
-    cli("sync", directory)
+    synced = cli("sync", directory)
+    assert "source" in synced and synced["workspace"] == "live-jobs"
+    assert cli("sync", directory, "--workspace", "live-jobs-b")["workspace"] == "live-jobs-b"
     job = cli("run", "success")
     # Every call is a new process/SSH connection; submission is intentionally detached.
     assert cli("job", "wait", job["id"])["state"] == "succeeded"
@@ -61,10 +67,22 @@ with tempfile.TemporaryDirectory(prefix="winix-live-") as directory:
         assert time.monotonic() < until, "Child did not start"
         time.sleep(1)
     assert cli("sync", directory, expected=3)["error"] == "busy"
-    cli("job", "cancel", job["id"])
+    assert cli("job", "cancel", job["id"])["escalation"] == ["cancel"]
     assert cli("job", "wait", job["id"], expected=1)["state"] == "cancelled"
     job = cli("run", "verify")
     assert cli("job", "wait", job["id"])["state"] == "succeeded"
     job = cli("run", "timeout")
     assert cli("job", "wait", job["id"], expected=1)["state"] == "timedOut"
-    print("Live jobs passed: detached execution, paged logs, artifacts, failure exit code, busy protection, cancellation with child cleanup, timeout")
+    started = time.monotonic()
+    job = cli("run", "held")
+    assert cli("job", "wait", job["id"])["state"] == "succeeded" and time.monotonic() - started < 45, "A child holding the output pipes kept the job alive"
+    job = cli("run", "teardown")
+    ended = cli("job", "wait", job["id"], expected=1)
+    assert ended["state"] == "timedOut" and ended["teardown"]["reason"] == "timed_out" and ended["teardown"]["exitCode"] == 0, ended
+    assert "teardown timed_out" in cli("job", "logs", job["id"])["text"]
+    job = cli("run", "slow", "--timeout", "4s", "--workspace", "live-jobs-b")
+    status = cli("job", "status", job["id"])
+    assert status["timeoutSeconds"] == 4 and status["workspace"] == "live-jobs-b" and "elapsedSeconds" in status
+    assert cli("job", "wait", job["id"], expected=1)["state"] == "timedOut"
+    print("Live jobs passed: detached execution, paged logs, artifacts, failure exit code, busy protection, cancellation with child cleanup, timeout,"
+          " pipe-holding children, teardown, per-run timeout, workspaces")

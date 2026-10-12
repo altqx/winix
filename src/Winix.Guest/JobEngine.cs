@@ -9,16 +9,64 @@ namespace Winix.Guest;
 internal sealed class JobEngine : IDisposable
 {
     private readonly object gate = new();
-    private readonly Dictionary<string, CancellationTokenSource> running = [];
+    private readonly Dictionary<string, RunningJob> running = [];
     public string? Active { get { lock (gate) return running.Keys.FirstOrDefault(); } }
     private static string DirectoryFor(string id) => Path.Combine(Program.Root, "jobs", Paths.Id(id));
+    /// <summary>How long the output pumps may run on after the wrapper exits. A child that inherited the pipes (a detached app) keeps them open forever.</summary>
+    private static readonly TimeSpan DrainLimit = TimeSpan.FromSeconds(5);
+
+    /// <summary>A job holding the guest, from start through artifact collection and teardown.</summary>
+    private sealed class RunningJob(JobRequest request)
+    {
+        public JobRequest Request { get; } = request;
+        public CancellationTokenSource Cancel { get; } = new();
+        /// <summary><c>cancelled</c> or <c>timed_out</c> once a stop was asked for; persisted as the job's <c>cancel</c> file.</summary>
+        public string? Reason;
+        private readonly object sync = new();
+        private Process? process; private WindowsJob? job; private bool tearingDown;
+        public void Attach(Process p, WindowsJob? j) { lock (sync) { process = p; job = j; } }
+        /// <summary>From here on <see cref="Kill"/> leaves the wrapper alone: teardown always gets its own timeout, even after a forced stop.</summary>
+        public void BeginTeardown() { lock (sync) tearingDown = true; }
+        /// <summary>Kills the task's wrapper and everything it started, detached or not.</summary>
+        public void Kill()
+        {
+            lock (sync)
+            {
+                if (tearingDown) return;
+                try { job?.Terminate(); } catch (Exception) { }
+                try { if (process is { HasExited: false }) process.Kill(true); } catch (Exception) { /* exited or disposed meanwhile */ }
+            }
+        }
+    }
+
     public JobEngine()
     {
         foreach (var path in Directory.GetFiles(Path.Combine(Program.Root, "jobs"), "record.json", SearchOption.AllDirectories))
         {
             var old = Wire.Decode<JobRecord>(File.ReadAllText(path));
-            if (!old.Terminal) Save(old with { State = JobState.Interrupted, FinishedAt = DateTimeOffset.UtcNow, Error = "Worker restarted; job was not automatically rerun." });
+            if (old.Terminal) continue;
+            // A stop that was asked for before the restart keeps its meaning; anything else was interrupted.
+            var marker = Path.Combine(DirectoryFor(old.Id), "cancel");
+            var reason = File.Exists(marker) ? File.ReadAllText(marker).Trim() : "interrupted";
+            var state = reason switch { "timed_out" => JobState.TimedOut, "cancelled" => JobState.Cancelled, _ => JobState.Interrupted };
+            var final = old with { State = state, Error = state == JobState.Interrupted ? "Worker restarted; job was not automatically rerun." : "Worker restarted while the job was being stopped." };
+            var requestFile = Path.Combine(DirectoryFor(old.Id), "request.json");
+            var request = File.Exists(requestFile) ? Wire.Decode<JobRequest>(File.ReadAllText(requestFile)) : null;
+            if (request is not null && !string.IsNullOrWhiteSpace(request.Task.Teardown)) Recover(request, final, reason);
+            else Save(final with { FinishedAt = DateTimeOffset.UtcNow });
         }
+    }
+    /// <summary>Runs the teardown of a job the previous worker left behind. The guest stays busy until it finishes.</summary>
+    private void Recover(JobRequest request, JobRecord final, string reason)
+    {
+        var run = new RunningJob(request);
+        lock (gate) running[request.Id] = run;
+        Save(final with { State = JobState.Running, Error = $"Worker restarted; running teardown ({reason})." });
+        _ = Task.Run(async () =>
+        {
+            var teardown = await RunTeardown(run, reason);
+            lock (gate) { Save(final with { FinishedAt = DateTimeOffset.UtcNow, Teardown = teardown }); running.Remove(request.Id); }
+        });
     }
     private static void Save(JobRecord record) => StateStore.Atomic(Path.Combine(DirectoryFor(record.Id), "record.json"), Wire.Encode(record));
     public JobRecord Status(string id)
@@ -34,31 +82,57 @@ internal sealed class JobEngine : IDisposable
             if (File.Exists(Path.Combine(DirectoryFor(request.Id), "record.json"))) return Status(request.Id);
             if (running.Count > 0) throw new WinixException("busy", "A job is already running.");
             var root = Path.Combine(Program.Root, "work", request.Workspace);
-            if (!Directory.Exists(root)) throw new WinixException("workspace_missing", "Synchronize sources before starting a job.");
+            if (!Directory.Exists(root)) throw new WinixException("workspace_missing", $"Synchronize sources into workspace {request.Workspace} before starting a job.");
             Paths.Under(root, request.Task.WorkingDirectory, true);
             if (request.Task.ScriptFile is { } scriptFile && !File.Exists(Paths.Under(root, scriptFile))) throw new WinixException("script_missing", $"scriptFile not found in the workspace: {scriptFile}");
             Directory.CreateDirectory(DirectoryFor(request.Id));
-            var record = new JobRecord(request.Id, request.Workspace, JobState.Queued, DateTimeOffset.UtcNow, Label: request.Label, Parameters: request.Parameters, Detached: request.Task.Detach, Elevated: request.Task.Elevated);
+            var record = new JobRecord(request.Id, request.Workspace, JobState.Queued, DateTimeOffset.UtcNow, Label: request.Label, Parameters: request.Parameters,
+                Detached: request.Task.Detach, Elevated: request.Task.Elevated, TimeoutSeconds: request.Task.TimeoutSeconds, Source: SyncedSource(request.Workspace));
             Save(record);
             File.WriteAllText(Path.Combine(DirectoryFor(request.Id), "request.json"), Wire.Encode(request));
-            var cancel = new CancellationTokenSource(); running.Add(request.Id, cancel);
-            _ = Task.Run(() => Execute(request, record, cancel));
+            var run = new RunningJob(request); running.Add(request.Id, run);
+            _ = Task.Run(() => Execute(run, record));
             return record;
         }
     }
-    public JobRecord Cancel(string id)
+    /// <summary>The commit the workspace was last synchronized from, as recorded by <c>sync</c>.</summary>
+    private static SourceInfo? SyncedSource(string workspace)
     {
-        lock (gate) { if (running.TryGetValue(id, out var cancel)) cancel.Cancel(); }
+        var state = Path.Combine(Program.Root, "work", workspace + ".manifest.json");
+        try { return File.Exists(state) ? Wire.Decode<SyncManifest>(File.ReadAllText(state)).Source : null; }
+        catch (Exception e) when (e is IOException or System.Text.Json.JsonException or WinixException) { return null; }
+    }
+    /// <summary>
+    /// Stops a job. The first request cancels cooperatively (the task tree is terminated, teardown runs); <paramref name="force"/>
+    /// also kills whatever wrapper is current, including processes a detached task left running. <paramref name="reason"/>
+    /// <c>timed_out</c> marks a stop the host enforced because the job outlived its timeout.
+    /// </summary>
+    public JobRecord Cancel(string id, bool force = false, string? reason = null)
+    {
+        RunningJob? run;
+        lock (gate)
+        {
+            if (running.TryGetValue(id, out run))
+            {
+                run.Reason ??= reason == "timed_out" ? "timed_out" : "cancelled";
+                File.WriteAllText(Path.Combine(DirectoryFor(id), "cancel"), run.Reason);
+                run.Cancel.Cancel();
+            }
+        }
+        if (run is not null && force) run.Kill();
         return Status(id);
     }
-    private async Task Execute(JobRequest request, JobRecord record, CancellationTokenSource cancelled)
+    private async Task Execute(RunningJob run, JobRecord record)
     {
+        var request = run.Request;
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(request.Task.TimeoutSeconds));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancelled.Token, timeout.Token);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(run.Cancel.Token, timeout.Token);
         var dir = DirectoryFor(request.Id);
+        string? stopped = null;
         try
         {
-            Save(record with { State = JobState.Running });
+            record = record with { State = JobState.Running, StartedAt = DateTimeOffset.UtcNow };
+            Save(record);
             int exitCode;
             if (request.Task.Elevated)
             {
@@ -69,62 +143,129 @@ internal sealed class JobEngine : IDisposable
                 if (!result.GetProperty("ok").GetBoolean()) throw new WinixException(result.TryGetProperty("code", out var code) ? code.GetString()! : "elevated_failed", result.TryGetProperty("error", out var error) ? error.GetString()! : "Elevated task failed.");
                 exitCode = result.GetProperty("exitCode").GetInt32();
             }
-            else exitCode = await RunTask(request, dir, Path.Combine(dir, "request.json"), Path.Combine(dir, "output.log"), request.Task.Detach, linked.Token);
+            else exitCode = await RunTask(request, dir, Path.Combine(dir, "request.json"), Path.Combine(dir, "output.log"), request.Task.Detach, linked.Token, run.Attach);
             record = record with { State = exitCode == 0 ? JobState.Succeeded : JobState.Failed, ExitCode = exitCode };
         }
-        catch (OperationCanceledException) { record = record with { State = cancelled.IsCancellationRequested ? JobState.Cancelled : JobState.TimedOut }; }
+        catch (OperationCanceledException)
+        {
+            string reason; lock (gate) reason = run.Reason ?? "timed_out";
+            stopped = reason;
+            record = record with { State = reason == "cancelled" ? JobState.Cancelled : JobState.TimedOut };
+            if (reason == "timed_out") record = record with { Error = $"Exceeded the {request.Task.TimeoutSeconds} s timeout." };
+        }
         catch (Exception e) { record = record with { State = JobState.Failed, Error = e.Message }; }
         finally
         {
             try { Collect(request); }
             catch (Exception e) { record = record with { State = JobState.Failed, Error = $"Artifact collection failed: {e.Message}" }; }
+            if (stopped is not null && !string.IsNullOrWhiteSpace(request.Task.Teardown)) record = record with { Teardown = await RunTeardown(run, stopped) };
             lock (gate)
             {
                 Save(record with { FinishedAt = DateTimeOffset.UtcNow });
                 running.Remove(request.Id);
             }
-            cancelled.Dispose();
         }
+    }
+    /// <summary>The task's <c>teardown:</c> script, appended to the job log under <c>[teardown:…]</c> and bounded only by its own timeout.</summary>
+    private static async Task<TeardownResult> RunTeardown(RunningJob run, string reason)
+    {
+        var request = run.Request; var task = request.Task; var dir = DirectoryFor(request.Id);
+        var environment = new Dictionary<string, string>(task.Environment) { ["WINIX_TEARDOWN_REASON"] = reason };
+        var teardown = request with { Task = new TaskSpec { Script = task.Teardown, WorkingDirectory = task.WorkingDirectory, VisualStudio = false,
+            Architecture = task.Architecture, Environment = environment, TimeoutSeconds = task.TeardownTimeoutSeconds } };
+        var file = Path.Combine(dir, "teardown.json");
+        run.BeginTeardown();
+        try
+        {
+            File.WriteAllText(file, Wire.Encode(teardown));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(task.TeardownTimeoutSeconds));
+            return new(reason, await RunTask(teardown, dir, file, Path.Combine(dir, "output.log"), false, timeout.Token, run.Attach, "teardown"));
+        }
+        catch (OperationCanceledException) { return new(reason, null, $"Teardown exceeded {task.TeardownTimeoutSeconds} s and was stopped."); }
+        catch (Exception e) { return new(reason, null, e.Message); }
     }
     /// <summary>
     /// Runs the task's PowerShell wrapper. Without <paramref name="detach"/> the process tree lives in a kill-on-close
     /// job object; with it, processes the task starts (an app under test) outlive the task and only the wrapper is killed on cancel.
+    /// With <paramref name="tag"/> (teardown) the log is appended to and its lines are tagged.
     /// </summary>
-    internal static async Task<int> RunTask(JobRequest request, string scratchDir, string requestFile, string logPath, bool detach, CancellationToken ct)
+    internal static async Task<int> RunTask(JobRequest request, string scratchDir, string requestFile, string logPath, bool detach, CancellationToken ct,
+        Action<Process, WindowsJob?>? started = null, string? tag = null)
     {
-        File.WriteAllText(Path.Combine(scratchDir, "invoke.ps1"), Wrapper, new UTF8Encoding(true));
+        var script = Path.Combine(scratchDir, tag is null ? "invoke.ps1" : $"invoke-{tag}.ps1");
+        File.WriteAllText(script, Wrapper, new UTF8Encoding(true));
         var workspace = Path.Combine(Program.Root, "work", request.Workspace);
         var start = new ProcessStartInfo("powershell.exe") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true,
             StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8,
             CreateNoWindow = true, WorkingDirectory = Paths.Under(workspace, request.Task.WorkingDirectory, true) };
-        foreach (var arg in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", Path.Combine(scratchDir, "invoke.ps1"), "-RequestFile", requestFile, "-WorkspaceRoot", workspace, "-CacheDir", Program.Dir("cache") }) start.ArgumentList.Add(arg);
+        foreach (var arg in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, "-RequestFile", requestFile, "-WorkspaceRoot", workspace, "-CacheDir", Program.Dir("cache") }) start.ArgumentList.Add(arg);
         foreach (var (key, value) in request.Task.Environment) start.Environment[key] = value;
         start.Environment["WINIX_JOB_ID"] = request.Id; start.Environment["WINIX_WORKSPACE"] = workspace;
         if (request.Label is not null) start.Environment["WINIX_JOB_LABEL"] = request.Label;
         start.Environment["WINIX_ARGS"] = Wire.Encode(request.Parameters?.Args ?? []);
+        SharedCaches(start.Environment);
         using var process = new Process { StartInfo = start };
         using var job = detach ? null : new WindowsJob();
-        process.Start(); job?.Assign(process);
-        await using var stream = new FileStream(logPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+        process.Start(); job?.Assign(process); started?.Invoke(process, job);
+        // Lets a worker restart from outside (winix guest restart) find and end the tree.
+        try { File.WriteAllText(Path.Combine(scratchDir, tag is null ? "pid" : $"pid-{tag}"), process.Id.ToString()); } catch (IOException) { }
+        await using var stream = new FileStream(logPath, tag is null ? FileMode.Create : FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
         await using var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
         using var logGate = new SemaphoreSlim(1);
+        var closed = false;
         async Task Pump(StreamReader source, string name)
         {
-            while (await source.ReadLineAsync() is { } line)
+            try
             {
-                await logGate.WaitAsync();
-                try { await writer.WriteLineAsync($"[{name}] {line}"); } finally { logGate.Release(); }
+                while (await source.ReadLineAsync() is { } line)
+                {
+                    await logGate.WaitAsync();
+                    try { if (!closed) await writer.WriteLineAsync($"[{name}] {line}"); } finally { logGate.Release(); }
+                }
             }
+            catch (Exception e) when (e is ObjectDisposedException or IOException) { /* abandoned after the drain limit */ }
         }
-        var output = Pump(process.StandardOutput, "out"); var errors = Pump(process.StandardError, "err");
+        var output = Pump(process.StandardOutput, tag is null ? "out" : tag + ":out"); var errors = Pump(process.StandardError, tag is null ? "err" : tag + ":err");
         try { await process.WaitForExitAsync(ct); }
         catch (OperationCanceledException)
         {
             if (job is not null) job.Terminate(); else { try { process.Kill(false); } catch (InvalidOperationException) { } }
-            await process.WaitForExitAsync(); throw;
+            // A process that ignores termination must not hold the job forever either.
+            await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(TimeSpan.FromSeconds(10)));
+            throw;
         }
-        finally { if (process.HasExited) job?.Terminate(); await Task.WhenAll(output, errors); }
+        finally
+        {
+            if (process.HasExited) job?.Terminate();
+            // Output still arriving after the wrapper is gone comes from a child holding our pipes; stop waiting for it.
+            var drained = Task.WhenAll(output, errors);
+            if (await Task.WhenAny(drained, Task.Delay(DrainLimit)) != drained)
+            {
+                await logGate.WaitAsync();
+                try { closed = true; await writer.WriteLineAsync($"[winix] Output pipes still held open {DrainLimit.TotalSeconds:0} s after the wrapper exited (a child inherited them); log capture stopped."); }
+                finally { logGate.Release(); }
+            }
+        }
         return process.ExitCode;
+    }
+    /// <summary>
+    /// Compiler and package caches shared by every workspace, so a work tree per branch does not mean a cold build per branch.
+    /// Values the task or the machine already set win.
+    /// </summary>
+    internal static void SharedCaches(IDictionary<string, string?> environment)
+    {
+        var cache = Program.Dir("cache");
+        void Default(string key, string path)
+        {
+            if (environment.TryGetValue(key, out var existing) && !string.IsNullOrEmpty(existing)) return;
+            try { Directory.CreateDirectory(path); environment[key] = path; } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+        Default("WINIX_CACHE", Path.Combine(cache, "shared"));
+        Default("CCACHE_DIR", Path.Combine(cache, "ccache"));
+        Default("SCCACHE_DIR", Path.Combine(cache, "sccache"));
+        Default("VCPKG_DEFAULT_BINARY_CACHE", Path.Combine(cache, "vcpkg-binary"));
+        // Paths under any work tree hash the same, so another branch's tree hits the same cache entries.
+        if (!(environment.TryGetValue("CCACHE_BASEDIR", out var basedir) && !string.IsNullOrEmpty(basedir))) environment["CCACHE_BASEDIR"] = Path.Combine(Program.Root, "work");
     }
     private static void Collect(JobRequest request)
     {
@@ -174,7 +315,7 @@ internal sealed class JobEngine : IDisposable
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
         return new { file = id + ".zip", size = new FileInfo(path).Length };
     }
-    public void Dispose() { lock (gate) foreach (var source in running.Values) source.Cancel(); }
+    public void Dispose() { lock (gate) foreach (var run in running.Values) run.Cancel.Cancel(); }
     /// <summary>
     /// The in-guest task wrapper. The Visual Studio developer environment is captured once per VS version and
     /// architecture and replayed from a cache on later runs (PATH is prepended, other variables set).
