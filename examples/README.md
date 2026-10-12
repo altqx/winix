@@ -13,4 +13,4 @@ Or stop the development VM and use `./winix ci --config examples/acceptance.yaml
 
 For a shorter native build/CTest check, use `./winix ci --config examples/native-ci.yaml`. Running it twice also checks that a file created by the first run is absent from the second VM.
 
-These are test fixtures, not production app templates. Their package identity is `Winix.Smoke` / publisher `CN=Winix Development`; packaging uses the VM's development certificate. UI tests compare actual control values and save screenshots. See `docs/acceptance.md` for execution evidence.
+These are test fixtures, not production app templates. Their package identity is `Winix.Smoke` / publisher `CN=Winix Development`; packaging uses the VM's development certificate. UI tests compare actual control values and save screenshots.

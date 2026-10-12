@@ -175,7 +175,7 @@ internal static class Entry
                 case "guest":
                     if (args.Word(1) == "driver" && args.Word(2) == "add") result = await service.Elevated(vm, "driver-add", new { inf = args.Word(3) }, owner, ct);
                     else if (args.Word(1) == "update")
-                        result = await service.UpdateGuest(vm, Path.GetFullPath(args.Option("guest") ?? new[] { "artifacts/release/guest", "artifacts/guest" }.FirstOrDefault(d => File.Exists(Path.Combine(d, "winix-guest.exe"))) ?? "artifacts/guest"), owner, ct);
+                        result = await service.UpdateGuest(vm, Path.GetFullPath(args.Option("guest") ?? new[] { "artifacts/release/guest", "artifacts/guest", Path.Combine(AppContext.BaseDirectory, "guest") }.FirstOrDefault(d => File.Exists(Path.Combine(d, "winix-guest.exe"))) ?? "artifacts/guest"), owner, ct);
                     else if (args.Word(1) == "restart") result = await service.GuestRestart(vm, owner, ct);
                     else throw new WinixException("usage", "guest driver add GUEST_INF_PATH | guest update [--guest DIR] | guest restart");
                     break;

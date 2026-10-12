@@ -11,6 +11,7 @@ rm -rf "$staging" artifacts/release.old
 dotnet publish src/Winix.Cli -c Release -r linux-x64 --self-contained true -p:PublishReadyToRun=true -p:PublishSingleFile=true -p:InvariantGlobalization=true -o "$staging"
 dotnet publish src/Winix.Guest -c Release -r win-x64 --self-contained true -p:PublishReadyToRun=true -o "$staging/guest"
 cp -r skills "$staging/"
+cp scripts/install.sh README.md "$staging/"
 if [ -d artifacts/release ]; then mv artifacts/release artifacts/release.old; fi
 mv "$staging" artifacts/release
 rm -rf artifacts/release.old
