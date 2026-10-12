@@ -7,6 +7,9 @@ set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 staging="artifacts/release.staging"
+# Publishing for a runtime adds implicit packages (ILLink tasks pinned to the local SDK) that a plain restore does not
+# request; keep the committed lock files out of it so CI's locked restore stays valid.
+export RestorePackagesWithLockFile=false
 rm -rf "$staging" artifacts/release.old
 dotnet publish src/Winix.Cli -c Release -r linux-x64 --self-contained true -p:PublishReadyToRun=true -p:PublishSingleFile=true -p:InvariantGlobalization=true -o "$staging"
 dotnet publish src/Winix.Guest -c Release -r win-x64 --self-contained true -p:PublishReadyToRun=true -o "$staging/guest"
