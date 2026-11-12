@@ -9,6 +9,8 @@ internal static class Program
 {
     public const string Root = @"C:\Winix";
     public const string Pipe = "winix-desktop-v1";
+    /// <summary>Why the last worker failed to start. Task Scheduler only keeps its exit code, so <c>rpc</c> reports this instead.</summary>
+    private static readonly string WorkerError = Path.Combine(Root, "worker-error.json");
     /// <summary>Per-monitor-V2 DPI awareness, so screenshots and coordinates are physical pixels at any scaling.</summary>
     public static bool DpiAware { get; private set; }
     /// <summary>A Winix data directory: the provisioned <c>C:\Winix\&lt;name&gt;</c>, or a fallback inside the writable work tree on older images.</summary>
@@ -38,7 +40,7 @@ internal static class Program
                 var request = await Console.In.ReadLineAsync() ?? throw new WinixException("invalid_request", "Expected one JSON request.");
                 using var pipe = new NamedPipeClientStream(".", Pipe, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
                 try { await pipe.ConnectAsync(10000); }
-                catch (TimeoutException) { throw new WinixException("desktop_unavailable", "The Winix desktop worker is not running. Log into the test account."); }
+                catch (TimeoutException) { throw new WinixException("desktop_unavailable", "The Winix desktop worker is not running. " + (LastWorkerError() ?? "Log into the test account.")); }
                 using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
                 using var reader = new StreamReader(pipe, leaveOpen: true);
                 await writer.WriteLineAsync(request);
@@ -54,7 +56,15 @@ internal static class Program
             var console = GetConsoleWindow();
             if (console != IntPtr.Zero) ShowWindow(console, 0);
             foreach (var dir in new[] { "work", "jobs", "inbox", "exports" }) Directory.CreateDirectory(Path.Combine(Root, dir));
-            using var dispatcher = new Dispatcher();
+            Dispatcher dispatcher;
+            try { dispatcher = new Dispatcher(); }
+            catch (Exception e)
+            {
+                try { StateStore.Atomic(WorkerError, Wire.Encode(new { at = DateTimeOffset.UtcNow, error = e.ToString() })); } catch (Exception) { }
+                throw;
+            }
+            File.Delete(WorkerError);
+            using var owned = dispatcher;
             while (true)
             {
                 var server = new NamedPipeServerStream(Pipe, PipeDirection.InOut, 16, PipeTransmissionMode.Byte,
@@ -68,6 +78,17 @@ internal static class Program
             Console.WriteLine(Wire.Encode(new GuestResponse(false, Wire.Element(new { }), (e as WinixException)?.Code ?? "guest_error", e.Message)));
             return args is ["rpc"] ? 0 : 1;
         }
+    }
+    private static string? LastWorkerError()
+    {
+        try
+        {
+            if (!File.Exists(WorkerError)) return null;
+            var failure = Wire.Decode<System.Text.Json.JsonElement>(File.ReadAllText(WorkerError));
+            var error = failure.GetProperty("error").GetString()?.Split('\n')[0].Trim();
+            return $"It failed to start at {failure.GetProperty("at").GetString()}: {error} (full trace in {WorkerError})";
+        }
+        catch (Exception) { return null; }
     }
     private static async Task Handle(NamedPipeServerStream pipe, Dispatcher dispatcher)
     {

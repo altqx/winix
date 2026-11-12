@@ -42,6 +42,35 @@ public sealed class CoreTests : IDisposable
         Assert.Equal(record, new StateStore(root).Read<HostJob>("jobs", record.Id));
     }
 
+    [Fact]
+    public void AtomicWriteReplacesFileAndLeavesNoTemp()
+    {
+        var path = Path.Combine(root, "record.json");
+        StateStore.Atomic(path, "{\"a\":1}"); StateStore.Atomic(path, "{\"a\":2}");
+        Assert.Equal("{\"a\":2}", File.ReadAllText(path));
+        Assert.Equal([path], Directory.GetFiles(root));
+    }
+
+    [Fact]
+    public void NulFilledRecordIsQuarantinedInsteadOfThrowing()
+    {
+        // What a power loss left behind in issue #1: the right length, all zeros.
+        var path = Path.Combine(root, "record.json");
+        File.WriteAllBytes(path, new byte[649]);
+        Assert.Null(StateStore.ReadOrQuarantine<HostJob>(path));
+        Assert.False(File.Exists(path));
+        Assert.Equal(new byte[649], File.ReadAllBytes(path + ".corrupt"));
+    }
+
+    [Fact]
+    public void ValidRecordDecodesWithoutQuarantine()
+    {
+        var path = Path.Combine(root, "record.json"); var record = new HostJob("dev", "app", "job-one", DateTimeOffset.UtcNow);
+        StateStore.Atomic(path, Wire.Encode(record));
+        Assert.Equal(record, StateStore.ReadOrQuarantine<HostJob>(path));
+        Assert.False(File.Exists(path + ".corrupt"));
+    }
+
     [Theory]
     [InlineData("qcow2", false, "cp")]
     [InlineData("qcow2", true, "qemu-img")]

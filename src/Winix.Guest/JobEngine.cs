@@ -43,15 +43,15 @@ internal sealed class JobEngine : IDisposable
     {
         foreach (var path in Directory.GetFiles(Path.Combine(Program.Root, "jobs"), "record.json", SearchOption.AllDirectories))
         {
-            var old = Wire.Decode<JobRecord>(File.ReadAllText(path));
-            if (old.Terminal) continue;
+            // A record that no longer decodes is set aside: failing here would stop the worker, and with it every other job.
+            if (StateStore.ReadOrQuarantine<JobRecord>(path) is not { } old || old.Terminal) continue;
             // A stop that was asked for before the restart keeps its meaning; anything else was interrupted.
             var marker = Path.Combine(DirectoryFor(old.Id), "cancel");
             var reason = File.Exists(marker) ? File.ReadAllText(marker).Trim() : "interrupted";
             var state = reason switch { "timed_out" => JobState.TimedOut, "cancelled" => JobState.Cancelled, _ => JobState.Interrupted };
             var final = old with { State = state, Error = state == JobState.Interrupted ? "Worker restarted; job was not automatically rerun." : "Worker restarted while the job was being stopped." };
             var requestFile = Path.Combine(DirectoryFor(old.Id), "request.json");
-            var request = File.Exists(requestFile) ? Wire.Decode<JobRequest>(File.ReadAllText(requestFile)) : null;
+            var request = File.Exists(requestFile) ? StateStore.ReadOrQuarantine<JobRequest>(requestFile) : null;
             if (request is not null && !string.IsNullOrWhiteSpace(request.Task.Teardown)) Recover(request, final, reason);
             else Save(final with { FinishedAt = DateTimeOffset.UtcNow });
         }
@@ -89,7 +89,7 @@ internal sealed class JobEngine : IDisposable
             var record = new JobRecord(request.Id, request.Workspace, JobState.Queued, DateTimeOffset.UtcNow, Label: request.Label, Parameters: request.Parameters,
                 Detached: request.Task.Detach, Elevated: request.Task.Elevated, TimeoutSeconds: request.Task.TimeoutSeconds, Source: SyncedSource(request.Workspace));
             Save(record);
-            File.WriteAllText(Path.Combine(DirectoryFor(request.Id), "request.json"), Wire.Encode(request));
+            StateStore.Atomic(Path.Combine(DirectoryFor(request.Id), "request.json"), Wire.Encode(request));
             var run = new RunningJob(request); running.Add(request.Id, run);
             _ = Task.Run(() => Execute(run, record));
             return record;
