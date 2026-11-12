@@ -26,7 +26,7 @@ public static class Wire
 
 public static class WinixVersion
 {
-    public const string Current = "0.2.1";
+    public const string Current = "0.3.0";
 }
 
 public sealed class WinixException(string code, string message) : Exception(message)
