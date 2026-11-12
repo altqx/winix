@@ -8,8 +8,12 @@ repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 staging="artifacts/release.staging"
 # Publishing for a runtime adds implicit packages (ILLink tasks pinned to the local SDK) that a plain restore does not
-# request; keep the committed lock files out of it so CI's locked restore stays valid.
-export RestorePackagesWithLockFile=false
+# request and writes into the lock files. Put the committed lock files back afterwards, so CI's locked restore stays
+# valid. (Turning lock files off is not an option: NuGet refuses that while lock files exist, NU1005.)
+locks="$(mktemp -d)"
+for lock in src/*/packages.lock.json tests/*/packages.lock.json; do mkdir -p "$locks/$(dirname "$lock")"; cp -p "$lock" "$locks/$lock"; done
+restore_locks() { (cd "$locks" && find . -name packages.lock.json -exec cp -p {} "$repo_dir/{}" \;); rm -rf "$locks"; }
+trap restore_locks EXIT
 rm -rf "$staging" artifacts/release.old
 dotnet publish src/Winix.Cli -c Release -r linux-x64 --self-contained true -p:PublishReadyToRun=true -p:PublishSingleFile=true -p:InvariantGlobalization=true -o "$staging"
 dotnet publish src/Winix.Guest -c Release -r win-x64 --self-contained true -p:PublishReadyToRun=true -o "$staging/guest"
