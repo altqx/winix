@@ -103,6 +103,12 @@ Subsystem sftp "$sshDirectory\sftp-server.exe"
     & "$root\measure.ps1" -Output "$root\measure-after.json" -Label 'after-debloat'
     New-Item "$root\debloat.done" -ItemType File -Force | Out-Null
   }
+  Status 'debugtools'
+  # Debuggers, Sysinternals, .NET diagnostics, clang-tidy/ASan, symbols, crash dumps; image build --no-debug-tools skips it.
+  if (!(Test-Path "$root\debugtools.done") -and $settings.debugTools -ne $false) {
+    & "$root\debugtools.ps1" -User winix
+    New-Item "$root\debugtools.done" -ItemType File -Force | Out-Null
+  }
   Status 'desktop'
   New-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Force | Out-Null
   New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Name AllowDevelopmentWithoutDevLicense -Value 1 -PropertyType DWord -Force | Out-Null
@@ -147,12 +153,16 @@ Subsystem sftp "$sshDirectory\sftp-server.exe"
   $measure = @{}; foreach ($m in @('before', 'after')) { if (Test-Path "$root\measure-$m.json") { $measure[$m] = Get-Content "$root\measure-$m.json" -Raw | ConvertFrom-Json } }
   $displayDrivers = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue | Select-Object FriendlyName, Status)
   $nvda = if (Test-Path "$root\nvda.json") { Get-Content "$root\nvda.json" -Raw | ConvertFrom-Json } else { $null }
+  # winix-pe.cmd disabled these offline unless image build had --keep-defender (4 = disabled).
+  $defenderState = [ordered]@{}; foreach ($s in @('WinDefend', 'WdFilter', 'WdBoot', 'WdNisSvc', 'MDCoreSvc')) { $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$s"; if (Test-Path $k) { $defenderState[$s] = (Get-ItemProperty $k).Start } }
+  $debugTools = if (Test-Path "$root\debugtools.json") { Get-Content "$root\debugtools.json" -Raw | ConvertFrom-Json } else { $null }
   @{ready=$true;visualStudio=$vs;dotnet=(& 'C:\Program Files\dotnet\dotnet.exe' --list-sdks);windows=(Get-ComputerInfo -Property WindowsVersion,OsBuildNumber);certificate=$certificate.Thumbprint;
-    elevated='WinixElevated';displayDrivers=$displayDrivers;debloat=$debloat;measure=$measure;nvda=$nvda} | ConvertTo-Json -Depth 12 | Set-Content "$root\toolchain.json"
+    elevated='WinixElevated';displayDrivers=$displayDrivers;debloat=$debloat;measure=$measure;nvda=$nvda;debugTools=$debugTools;defender=$defenderState} | ConvertTo-Json -Depth 12 | Set-Content "$root\toolchain.json"
   Status 'complete'
   Unregister-ScheduledTask WinixProvision -Confirm:$false
   Disable-LocalUser WinixSetup
-  Remove-Item "$root\Autounattend.xml","$root\settings.json" -Force -ErrorAction SilentlyContinue
+  # winix-pe.cmd placed the answer file in Panther; like the seed copy, it holds the account password.
+  Remove-Item "$root\Autounattend.xml","$root\settings.json","$env:SystemRoot\Panther\unattend.xml" -Force -ErrorAction SilentlyContinue
   Stop-Transcript
   Restart-Computer -Force
 } catch {

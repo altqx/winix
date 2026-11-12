@@ -204,6 +204,7 @@ internal sealed class JobEngine : IDisposable
         if (request.Label is not null) start.Environment["WINIX_JOB_LABEL"] = request.Label;
         start.Environment["WINIX_ARGS"] = Wire.Encode(request.Parameters?.Args ?? []);
         SharedCaches(start.Environment);
+        DebugTools.Apply(start.Environment);
         using var process = new Process { StartInfo = start };
         using var job = detach ? null : new WindowsJob();
         process.Start(); job?.Assign(process); started?.Invoke(process, job);

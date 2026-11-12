@@ -61,6 +61,7 @@ winix vm trust build-windows-dev && winix image seal --vm build-windows-dev --na
   - drags and pointer paths through the hypervisor's USB tablet, which also work on the lock screen.
 
   The worker is per-monitor DPI aware.
+- **Debugging and static analysis.** The image comes with Debugging Tools for Windows (cdb, WinDbg, gflags, symchk, umdh), Application Verifier, the Windows Performance Toolkit, Sysinternals (procdump, procmon, sigcheck, handle, listdlls, vmmap and more), the .NET diagnostics tools and ilspycmd, clang-tidy, clang-cl and AddressSanitizer. Jobs get all of them on `PATH` with a cached Microsoft symbol path. Crashes leave full dumps instead of a dialog. `debug analyze` triages a dump with `!analyze -v`. `debug pe` reports a binary's headers, ASLR/DEP/CFG flags, imports, exports, PDB key and signature. `guest tools install` adds all of this to an existing VM.
 - **Virtual hardware.** Several monitors, a silent audio endpoint for WASAPI tests, USB devices at boot, and USB hot-plug timed to a marker in a job's log.
 - **Shared VMs.** Leases with an idle timeout and a first-come-first-served queue, a separate work tree per branch with shared compiler caches, and snapshots to revert to a known baseline before each evidence run.
 - **Clean CI runs.** `winix ci` boots a throwaway overlay, runs the pipeline, saves each task's artifacts and deletes the VM.
@@ -124,6 +125,7 @@ The guest is a disposable development environment for code you trust. It is not 
 - Winix uses your user's `qemu:///session` libvirt and never runs as root.
 - SSH to the guest binds only to `127.0.0.1`, and host keys are pinned through the QEMU guest agent.
 - No host folders are mounted; sources are copied in.
+- Microsoft Defender is disabled in the guest by default, for build speed: its services are switched off before Windows first boots. This is another reason not to run untrusted code there. `image build --keep-defender` keeps it on. VMs built before this change keep Defender until the image is rebuilt.
 - Tasks run as a standard desktop user. Admin work goes only through the explicit `elevated: true` path and `winix guest driver add`.
 - Windows media comes from Microsoft's CDN and is checked against a pinned SHA-256.
 - You supply the Windows license. Visual Studio's own license terms apply.

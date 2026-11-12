@@ -564,6 +564,63 @@ public sealed class WinixService(StateStore store, ICommandRunner runner)
         RequireAccess(vm, owner);
         return await RestartWorker(vm, ct);
     }
+    public static readonly string[] DebugToolComponents = ["sdk", "sysinternals", "dotnet", "vs", "symbols", "wer"];
+    /// <summary>
+    /// Installs or repairs the debugging, static-analysis and PE tools (provisioning/debugtools.ps1) on a running VM, as SYSTEM
+    /// through the QEMU guest agent. The recipe is copied into C:\Winix, which the test user cannot write, and its hash checked
+    /// before it runs. Jobs and the worker pick the tools up from C:\Winix\debugtools.json without a restart.
+    /// </summary>
+    public async Task<object> InstallDebugTools(string vm, IReadOnlyList<string>? components, string? owner, CancellationToken ct = default)
+    {
+        RequireAccess(vm, owner);
+        var selected = components is { Count: > 0 } ? components.SelectMany(c => c.Split(',')).Select(c => c.Trim().ToLowerInvariant()).Where(c => c.Length > 0).Distinct().ToArray() : DebugToolComponents;
+        if (selected.FirstOrDefault(c => !DebugToolComponents.Contains(c)) is { } unknown) throw new WinixException("usage", $"Unknown component {unknown}; use {string.Join(", ", DebugToolComponents)}.");
+        await RequireIdle(vm, ct);
+        // The SDK and Visual Studio steps download and install for many minutes.
+        var output = await RunRecipe(vm, "debugtools.ps1", $"-Components '{string.Join(',', selected)}' -User winix", TimeSpan.FromMinutes(90), ct);
+        var inventory = Wire.Decode<JsonElement>((await Vms.GuestExec(vm, @"C:\Windows\System32\cmd.exe", ["/c", @"type C:\Winix\debugtools.json"])).TrimStart('\uFEFF'));
+        return new { vm, components = selected, debugTools = inventory, guestOutput = output.Trim() };
+    }
+
+    private async Task RequireIdle(string vm, CancellationToken ct)
+    {
+        if (await Vms.Status(vm) != "running") throw new WinixException("vm_not_running", "Start the VM first.");
+        var health = await Guest(vm).Call("health", new { }, ct);
+        if (health.TryGetProperty("activeJob", out var active) && active.ValueKind != JsonValueKind.Null) throw new WinixException("busy", $"Job {active.GetString()} is running; wait or cancel it first.");
+    }
+    /// <summary>
+    /// Runs a provisioning recipe on a running VM as SYSTEM through the QEMU guest agent. It goes in over SSH and is copied into
+    /// C:\Winix, which the test user cannot write, and its hash checked before it runs.
+    /// </summary>
+    private async Task<string> RunRecipe(string vm, string recipeName, string arguments, TimeSpan timeout, CancellationToken ct)
+    {
+        var recipe = Path.Combine(AppContext.BaseDirectory, "provisioning", recipeName);
+        if (!File.Exists(recipe)) throw new WinixException("provisioning_missing", recipe);
+        var upload = Path.GetFileNameWithoutExtension(recipeName) + "-" + Guid.NewGuid().ToString("N") + ".ps1";
+        string sha256;
+        using (var file = File.OpenRead(recipe)) sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(file));
+        await Guest(vm).Upload(recipe, upload, ct);
+        var script = RecipeScript.Replace("__UPLOAD__", upload).Replace("__RECIPE__", recipeName).Replace("__SHA256__", sha256).Replace("__ARGUMENTS__", arguments);
+        return await Vms.GuestExec(vm, @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script))], timeout);
+    }
+    /// <summary>Read-only debugging helpers in the guest: dump triage with cdb, the crash-dump list, PE inspection.</summary>
+    public Task<JsonElement> Debug(string vm, string action, object arguments, string? owner, CancellationToken ct = default)
+    {
+        if (action is not ("analyze" or "dumps" or "pe")) throw new WinixException("usage", "debug analyze GUEST_DUMP | debug dumps | debug pe GUEST_PATH");
+        RequireAccess(vm, owner);
+        return Guest(vm).Call("debug." + action, arguments, ct);
+    }
+    private const string RecipeScript = """
+        $ErrorActionPreference = 'Stop'
+        $root = 'C:\Winix'; $upload = "$root\inbox\__UPLOAD__"; $recipe = "$root\__RECIPE__"
+        if (!(Test-Path -LiteralPath $upload)) { throw "Recipe not found: $upload" }
+        # A copy, not a move: the new file takes C:\Winix's ACL, so the test user cannot change it between the check and the run.
+        Copy-Item -LiteralPath $upload $recipe -Force
+        Remove-Item -LiteralPath $upload -Force
+        if ((Get-FileHash $recipe -Algorithm SHA256).Hash -ne '__SHA256__') { Remove-Item $recipe -Force; throw 'The uploaded recipe does not match the host copy.' }
+        & $recipe __ARGUMENTS__
+        """;
     private const string RestartScript = """
         $ErrorActionPreference = 'Continue'
         $root = 'C:\Winix'

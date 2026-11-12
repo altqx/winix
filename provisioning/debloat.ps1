@@ -2,7 +2,7 @@
 .SYNOPSIS
   Removes consumer apps, background work and update traffic a build/test VM never uses.
   Everything removed is recorded in a manifest so a rebuild is reproducible and the change is auditable.
-  Edge and WebView2 are kept (installers and apps may need them). Defender stays on with workspace exclusions.
+  Edge and WebView2 are kept (installers and apps may need them). Defender is disabled before first boot by winix-pe.cmd; with --keep-defender it stays on with workspace exclusions.
 #>
 param([string]$Manifest = 'C:\Winix\debloat.json', [string[]]$Workspaces = @('C:\Winix', 'C:\Winix\work', 'C:\vcpkg'))
 $ErrorActionPreference = 'Continue'
@@ -107,7 +107,7 @@ foreach ($policy in $policies) {
   }
 }
 
-# 7. Keep Defender, but keep it out of the build tree; keep search indexing off the workspace.
+# 7. Keep Defender out of the build tree (it matters with --keep-defender, which leaves Defender on); keep search indexing off the workspace.
 foreach ($workspace in $Workspaces) {
   Try-Step "exclusion $workspace" {
     if (Test-Path $workspace) {

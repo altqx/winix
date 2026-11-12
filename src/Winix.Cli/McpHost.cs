@@ -197,6 +197,19 @@ internal sealed class WinixTools(WinixService service)
     [McpServerTool(Name = "guest_restart"), Description("Restart a stuck guest worker through the QEMU guest agent. Unfinished jobs are ended (cancelled, timed out or interrupted) and their teardown runs.")]
     public Task<object> Restart(string vm, string? owner = null, CancellationToken cancellationToken = default) => Guard(() => service.GuestRestart(vm, Owner(owner), cancellationToken));
 
+    [McpServerTool(Name = "guest_tools_install"), Description("Install or repair debugging and static-analysis tools on a running VM as SYSTEM (takes minutes): components sdk (cdb, windbg, gflags, Application Verifier, WPR/xperf), sysinternals (procdump, procmon, sigcheck, handle, listdlls...), dotnet (dotnet-dump, -trace, -counters, -gcdump, -stack, -symbol, ilspycmd), vs (clang-tidy, clang-cl, AddressSanitizer), symbols (_NT_SYMBOL_PATH cache), wer (crash dumps, no crash dialog). Default all. Jobs get the tools on PATH.")]
+    public Task<object> ToolsInstall(string vm, string[]? components = null, string? owner = null, CancellationToken cancellationToken = default) => Guard(() => service.InstallDebugTools(vm, components, Owner(owner), cancellationToken));
+
+    [McpServerTool(Name = "debug_analyze"), Description("Run cdb over a guest dump file (!analyze -v by default, or your cdb commands separated by ';'). Returns the failure bucket, exception, faulting module and symbol, the stack, the output (first 48 KiB) and the guest path of the full transcript.")]
+    public Task<JsonElement> Analyze(string vm, string dump, string? commands = null, int timeoutSeconds = 600, string? owner = null, CancellationToken cancellationToken = default)
+        => Guard(() => service.Debug(vm, "analyze", new { dump, commands, timeoutMs = timeoutSeconds * 1000 }, Owner(owner), cancellationToken));
+
+    [McpServerTool(Name = "debug_dumps"), Description("List dump files in the guest, newest first: job_dump output and crash dumps Windows Error Reporting wrote.")]
+    public Task<JsonElement> Dumps(string vm, string? owner = null, CancellationToken cancellationToken = default) => Guard(() => service.Debug(vm, "dumps", new { }, Owner(owner), cancellationToken));
+
+    [McpServerTool(Name = "debug_pe"), Description("Inspect a PE file in the guest without running it: machine, subsystem, ASLR/DEP/CFG flags, sections, imports, delay imports, exports, the CodeView PDB path and symbol key, the .NET header, version resources and Authenticode status.")]
+    public Task<JsonElement> Pe(string vm, string path, string? owner = null, CancellationToken cancellationToken = default) => Guard(() => service.Debug(vm, "pe", new { path }, Owner(owner), cancellationToken));
+
     [McpServerTool(Name = "guest_driver_add"), Description("Install a driver (.inf path inside the guest) through the provisioned elevated SYSTEM task. Push the driver directory first with workspace_push.")]
     public Task<JsonElement> DriverAdd(string vm, string inf, string? owner = null, CancellationToken cancellationToken = default) => Guard(() => service.Elevated(vm, "driver-add", new { inf }, Owner(owner), cancellationToken));
 }

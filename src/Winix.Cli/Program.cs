@@ -46,7 +46,7 @@ internal static class Entry
                     {
                         "build" => await builder.Build(args.Option("name") ?? "windows-dev", args.Option("iso"),
                             Path.GetFullPath(args.Option("guest") ?? (Directory.Exists(Path.Combine(AppContext.BaseDirectory, "guest")) ? Path.Combine(AppContext.BaseDirectory, "guest") : "artifacts/guest")),
-                            args.Option("edition") ?? "Community", nvda: args.Option("nvda-url") is { } nvdaUrl ? new(nvdaUrl, args.Option("nvda-sha256") ?? throw new WinixException("usage", "--nvda-url needs --nvda-sha256.")) : null),
+                            args.Option("edition") ?? "Community", nvda: args.Option("nvda-url") is { } nvdaUrl ? new(nvdaUrl, args.Option("nvda-sha256") ?? throw new WinixException("usage", "--nvda-url needs --nvda-sha256.")) : null, debugTools: !args.Flag("no-debug-tools"), keepDefender: args.Flag("keep-defender")),
                         "seal" => await builder.Seal(args.Option("vm") ?? "build-windows-dev", args.Option("name") ?? "windows-dev"),
                         "list" => store.List<ImageManifest>("images"),
                         "status" => await service.Vms.ProvisionStatus(args.Option("vm") ?? "build-windows-dev"),
@@ -177,8 +177,21 @@ internal static class Entry
                     else if (args.Word(1) == "update")
                         result = await service.UpdateGuest(vm, Path.GetFullPath(args.Option("guest") ?? new[] { "artifacts/release/guest", "artifacts/guest", Path.Combine(AppContext.BaseDirectory, "guest") }.FirstOrDefault(d => File.Exists(Path.Combine(d, "winix-guest.exe"))) ?? "artifacts/guest"), owner, ct);
                     else if (args.Word(1) == "restart") result = await service.GuestRestart(vm, owner, ct);
-                    else throw new WinixException("usage", "guest driver add GUEST_INF_PATH | guest update [--guest DIR] | guest restart");
+                    else if (args.Word(1) == "tools" && args.Word(2) == "install") result = await service.InstallDebugTools(vm, args.Option("components")?.Split(','), owner, ct);
+                    else throw new WinixException("usage", "guest driver add GUEST_INF_PATH | guest update [--guest DIR] | guest restart | guest tools install [--components LIST]");
                     break;
+                case "debug":
+                {
+                    var action = args.Word(1);
+                    var timeoutMs = args.Option("timeout") is { } t ? (int?)Paths.Duration(t).TotalMilliseconds : null;
+                    result = await service.Debug(vm, action, action switch
+                    {
+                        "analyze" => new { dump = args.Word(2), commands = args.Option("commands"), timeoutMs },
+                        "pe" => new { path = args.Word(2) },
+                        _ => (object)new { },
+                    }, owner, ct);
+                    break;
+                }
                 case "ci":
                     result = await service.Ci(configFile, root, args.Option("output") ?? "artifacts/runs", ct);
                     Print(result, json); return Wire.Element(result).GetProperty("succeeded").GetBoolean() ? 0 : 1;
@@ -288,6 +301,8 @@ Winix — Windows build and desktop testing from Linux
   image build [--iso PATH]         Provision Windows + full Visual Studio Community
              [--guest DIR] [--edition Community|Professional|Enterprise]
              [--nvda-url URL --nvda-sha256 HASH]   Optional NVDA portable recipe
+             [--no-debug-tools]   Skip debuggers, Sysinternals, .NET diagnostics, clang-tidy/ASan, symbols, crash dumps
+             [--keep-defender]    Leave Microsoft Defender on (by default it is disabled before Windows first boots)
   image seal --vm NAME --name ID   Shut down and capture a verified baseline
   image list                      List immutable images
   image status --vm NAME          Read provisioning stage through QEMU guest agent
@@ -321,6 +336,13 @@ Winix — Windows build and desktop testing from Linux
   guest driver add GUEST_INF      Install a driver through the provisioned elevated task
   guest update [--guest DIR]      Replace the worker on a running VM with a published guest (via QEMU guest agent)
   guest restart                   Restart a stuck worker (via QEMU guest agent); unfinished jobs end, teardown runs
+  guest tools install             Install or repair debugging/analysis tools on a running VM, as SYSTEM
+     [--components LIST]          sdk (cdb, windbg, gflags, AppVerifier, WPR), sysinternals, dotnet (dotnet-dump,
+                                 -trace, ilspycmd...), vs (clang-tidy, ASan), symbols, wer (crash dumps); default all
+  debug analyze GUEST_DUMP        cdb !analyze -v over a dump: bucket, exception, faulting module, stack, transcript
+     [--commands 'CMDS'] [--timeout 10m]   Other cdb commands instead, e.g. '~*kb;lm'
+  debug dumps                     Dumps from job dump and from crashes (WER LocalDumps), newest first
+  debug pe GUEST_PATH             PE headers, mitigations (ASLR/DEP/CFG), imports, exports, PDB key, .NET header, signature
   version                         Print the Winix version
   ci                              Clean overlay → sync → pipeline → export → cleanup
   mcp                             Strict MCP 2026-07-28 stdio server
@@ -373,10 +395,10 @@ internal sealed class Arguments
     public List<string> Words { get; } = [];
     private readonly Dictionary<string, string?> options = [];
     private readonly Dictionary<string, List<string>> multi = [];
-    private static readonly HashSet<string> Flags = ["json", "help", "wait", "force", "follow", "all", "queue", "hold", "release", "full", "no-console", "fresh-profile", "include-hidden", "continue-on-error", "single", "restart"];
+    private static readonly HashSet<string> Flags = ["json", "help", "wait", "force", "follow", "all", "queue", "hold", "release", "full", "no-console", "fresh-profile", "include-hidden", "continue-on-error", "single", "restart", "no-debug-tools", "keep-defender"];
     private static readonly HashSet<string> Values = ["home", "vm", "config", "iso", "guest", "edition", "name", "output", "offset", "args", "exe", "app-id", "pid", "automation-id", "text", "keys",
         "window", "monitor", "cwd", "button", "path", "point", "map", "steps", "delay", "timeout", "depth", "limit", "backend", "label", "owner", "ttl", "note", "id", "props", "job", "marker", "file", "artifacts", "nvda-url", "nvda-sha256",
-        "workspace", "idle", "queue-timeout"];
+        "workspace", "idle", "queue-timeout", "components", "commands"];
     private static readonly HashSet<string> Repeatable = ["env", "arg"];
     public Arguments(string[] args)
     {

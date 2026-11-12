@@ -8,7 +8,7 @@ public sealed class ImageBuilder(StateStore store, ICommandRunner runner)
 {
     private readonly VmManager vms = new(store, runner);
     public record NvdaRecipe(string Url, string Sha256);
-    public async Task<VmRecord> Build(string name, string? iso, string guestDirectory, string edition = "Community", Resources? resources = null, NvdaRecipe? nvda = null)
+    public async Task<VmRecord> Build(string name, string? iso, string guestDirectory, string edition = "Community", Resources? resources = null, NvdaRecipe? nvda = null, bool debugTools = true, bool keepDefender = false)
     {
         Paths.Id(name);
         if (edition is not ("Community" or "Professional" or "Enterprise")) throw new WinixException("invalid_edition", "Use Community, Professional or Enterprise.");
@@ -36,12 +36,12 @@ public sealed class ImageBuilder(StateStore store, ICommandRunner runner)
         File.Copy(Path.Combine(directory, "id_ed25519.pub"), Path.Combine(seed, "authorized_keys"));
         var provisioning = Path.Combine(AppContext.BaseDirectory, "provisioning");
         if (!File.Exists(Path.Combine(provisioning, "bootstrap.ps1"))) throw new WinixException("provisioning_missing", provisioning);
-        // bootstrap.ps1 plus the debloat, measurement and optional NVDA recipes it calls, and the Visual Studio component list.
+        // winix-pe.cmd, bootstrap.ps1 plus the debloat, measurement, debug-tools and optional NVDA recipes it calls, and the Visual Studio component list.
         foreach (var file in Directory.GetFiles(provisioning)) File.Copy(file, Path.Combine(seed, Path.GetFileName(file)));
         if (nvda is not null && (nvda.Sha256.Length != 64 || !nvda.Sha256.All(Uri.IsHexDigit))) throw new WinixException("usage", "--nvda-sha256 must be a 64-digit hex SHA-256.");
         var password = Convert.ToHexString(RandomNumberGenerator.GetBytes(24)) + "aA1!";
-        File.WriteAllText(Path.Combine(seed, "settings.json"), Wire.Encode(new { edition, password, nvda }));
-        File.WriteAllText(Path.Combine(seed, "Autounattend.xml"), AnswerFile(password));
+        File.WriteAllText(Path.Combine(seed, "settings.json"), Wire.Encode(new { edition, password, nvda, debugTools }));
+        File.WriteAllText(Path.Combine(seed, "Autounattend.xml"), AnswerFile(password, keepDefender));
         if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(seed, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var seedIso = Path.Combine(directory, "seed.iso");
         await runner.Checked("xorriso", ["-as", "mkisofs", "-J", "-r", "-V", "WINIX_SEED", "-o", seedIso, seed]);
@@ -107,9 +107,10 @@ public sealed class ImageBuilder(StateStore store, ICommandRunner runner)
         else
             await runner.Checked("qemu-img", ["convert", "-O", "qcow2", source, destination]);
     }
-    public static string AnswerFile(string password)
+    public static string AnswerFile(string password, bool keepDefender = false)
     {
         var safePassword = System.Security.SecurityElement.Escape(password);
+        var peArguments = keepDefender ? "keep-defender" : "";
         return $$"""
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
@@ -121,11 +122,8 @@ public sealed class ImageBuilder(StateStore store, ICommandRunner runner)
       <DriverPaths><PathAndCredentials wcm:action="add" wcm:keyValue="1"><Path>E:\viostor\w11\amd64</Path></PathAndCredentials><PathAndCredentials wcm:action="add" wcm:keyValue="2"><Path>E:\NetKVM\w11\amd64</Path></PathAndCredentials></DriverPaths>
     </component>
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <DiskConfiguration><Disk wcm:action="add"><DiskID>0</DiskID><WillWipeDisk>true</WillWipeDisk>
-        <CreatePartitions><CreatePartition wcm:action="add"><Order>1</Order><Type>EFI</Type><Size>260</Size></CreatePartition><CreatePartition wcm:action="add"><Order>2</Order><Type>MSR</Type><Size>16</Size></CreatePartition><CreatePartition wcm:action="add"><Order>3</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition></CreatePartitions>
-        <ModifyPartitions><ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>FAT32</Format><Label>System</Label></ModifyPartition><ModifyPartition wcm:action="add"><Order>2</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter></ModifyPartition></ModifyPartitions>
-      </Disk><WillShowUI>OnError</WillShowUI></DiskConfiguration>
-      <ImageInstall><OSImage><InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/NAME</Key><Value>Windows 11 Pro</Value></MetaData></InstallFrom><InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo><WillShowUI>OnError</WillShowUI></OSImage></ImageInstall>
+      <!-- winix-pe.cmd on the seed partitions disk 0, applies the image and changes the installed system before it first boots. -->
+      <RunSynchronous><RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>cmd.exe /c "for %d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do @if exist %d:\winix-pe.cmd call %d:\winix-pe.cmd {{peArguments}}"</Path></RunSynchronousCommand></RunSynchronous>
       <UserData><AcceptEula>true</AcceptEula><FullName>Winix</FullName><Organization>Winix</Organization><ProductKey><Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key><WillShowUI>OnError</WillShowUI></ProductKey></UserData>
     </component>
   </settings>

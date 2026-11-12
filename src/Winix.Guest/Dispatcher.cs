@@ -24,7 +24,8 @@ internal sealed class Dispatcher : IDisposable
                 return new { version = WinixVersion.Current, user = System.Environment.UserName, interactive = System.Environment.UserInteractive,
                     desktopReady = Desktop.IsUnlocked(), activeJob = jobs.Active, dpiAware = Program.DpiAware, elevationAvailable = Elevation.Available,
                     features = new[] { "windows", "focus", "state", "batch", "monitors", "keys-scancode", "launch-env", "push-pull", "dump", "elevated", "incremental-sync",
-                        "cancel-force", "teardown", "run-timeout", "sync-source", "workspaces", "shared-cache" },
+                        "cancel-force", "teardown", "run-timeout", "sync-source", "workspaces", "shared-cache", "debug-tools", "debug-analyze", "debug-pe" },
+                    debugTools = DebugTools.Load(),
                     toolchain = File.Exists(@"C:\Winix\toolchain.json") ? Wire.Decode<JsonElement>(File.ReadAllText(@"C:\Winix\toolchain.json")) : Wire.Element(new { }) };
             case "job.status": return jobs.Status(id);
             case "job.logs": return jobs.Logs(id, a.TryGetProperty("offset", out var offset) ? offset.GetInt64() : 0);
@@ -40,6 +41,11 @@ internal sealed class Dispatcher : IDisposable
             }
             case "process.dump": return ProcessTools.Dump(a.GetProperty("pid").GetInt32(), a.TryGetProperty("full", out var full) && full.GetBoolean(), !(a.TryGetProperty("stacks", out var stacks) && !stacks.GetBoolean()));
             case "system.devices": return await ProcessTools.Devices();
+            case "debug.analyze":
+                return await DebugTools.Analyze(Expand(a.GetProperty("dump").GetString()!), a.TryGetProperty("commands", out var commands) && commands.ValueKind == JsonValueKind.String ? commands.GetString() : null,
+                    a.TryGetProperty("timeoutMs", out var analyzeTimeout) && analyzeTimeout.ValueKind == JsonValueKind.Number ? Math.Max(10, analyzeTimeout.GetInt32() / 1000) : 600);
+            case "debug.dumps": return DebugTools.Dumps();
+            case "debug.pe": return await DebugTools.Pe(Expand(a.GetProperty("path").GetString()!));
             case "file.put": return FilePut(a);
             case "file.get": return FileGet(a);
             case "file.remove":
@@ -158,8 +164,8 @@ internal static class ProcessTools
         string? stackFile = null; string? stackError = null;
         if (stacks)
         {
-            var cdb = new[] { @"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe", @"C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe" }.FirstOrDefault(File.Exists);
-            if (cdb is null) stackError = "cdb.exe not found; install Debugging Tools for Windows (Windows SDK) in the image.";
+            var cdb = DebugTools.Find("cdb");
+            if (cdb is null) stackError = "cdb.exe not found; run winix guest tools install --components sdk.";
             else
             {
                 stackFile = baseName + ".stacks.txt";
